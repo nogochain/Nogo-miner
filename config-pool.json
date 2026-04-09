@@ -1,0 +1,39 @@
+{
+  "rpc": {
+    "url": "http://127.0.0.1:8085",
+    "ws_url": "ws://127.0.0.1:8085/stratum",
+    "timeout_seconds": 30,
+    "max_retries": 5,
+    "retry_delay_seconds": 2
+  },
+  "pools": [
+    {
+      "name": "local-pool",
+      "url": "ws://127.0.0.1:8085/stratum",
+      "ws_url": "ws://127.0.0.1:8085/stratum",
+      "address": "NOGO0094bc928c08baf466e75fc617f10569a25b1e455caaa421b7f0da239fd5a252b67e070048",
+      "priority": 1,
+      "enabled": true
+    }
+  ],
+  "miner": {
+    "threads": 4,
+    "batch_size": 100,
+    "share_difficulty": 1000
+  },
+  "logging": {
+    "level": "debug",
+    "file": "nogominer-pool.log",
+    "max_size_mb": 10,
+    "max_backups": 3,
+    "max_age_days": 30,
+    "compress": false,
+    "json_format": false
+  },
+  "monitor": {
+    "enabled": true,
+    "update_interval_seconds": 5,
+    "prometheus_enabled": false,
+    "prometheus_port": 9090
+  }
+}

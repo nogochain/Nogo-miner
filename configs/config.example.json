@@ -1,0 +1,39 @@
+{
+  "rpc": {
+    "url": "http://localhost:8080",
+    "ws_url": "ws://localhost:8080/ws",
+    "timeout_seconds": 30,
+    "max_retries": 5,
+    "retry_delay_seconds": 2
+  },
+  "pools": [
+    {
+      "name": "local-node",
+      "url": "http://localhost:8080",
+      "ws_url": "ws://localhost:8080/ws",
+      "address": "NOGO006f44f4319250563c65919062932cc1cd7bae04045c355bf53bcb9d7f785c0b473fabfd7c",
+      "priority": 1,
+      "enabled": true
+    }
+  ],
+  "miner": {
+    "threads": 0,
+    "batch_size": 1000,
+    "share_difficulty": 1000
+  },
+  "logging": {
+    "level": "info",
+    "file": "nogominer.log",
+    "max_size_mb": 10,
+    "max_backups": 3,
+    "max_age_days": 30,
+    "compress": true,
+    "json_format": false
+  },
+  "monitor": {
+    "enabled": true,
+    "update_interval_seconds": 10,
+    "prometheus_enabled": false,
+    "prometheus_port": 9090
+  }
+}
