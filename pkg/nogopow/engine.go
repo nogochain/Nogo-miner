@@ -606,14 +606,11 @@ func PutMatrix(m *denseMatrix) {
 	// In production, would use sync.Pool
 }
 
-// fnv computes FNV-1a hash
+// fnv computes FNV hash (matches node implementation)
 func fnv(a, b uint32) uint32 {
-	const (
-		fnvPrime = 0x01000193
-	)
-	hash := a ^ b
-	hash *= fnvPrime
-	return hash
+	// CRITICAL: Must match node implementation exactly!
+	// Node uses: a * prime ^ b (not standard FNV-1a)
+	return a*0x01000193 ^ b
 }
 
 // Cache represents the cache for NogoPow

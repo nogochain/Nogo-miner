@@ -196,11 +196,23 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 	// Update hash count
 	atomic.AddUint64(&w.hashCount, result.HashesTried)
 
-	// Update monitor
+	// Log hash rate for this mining session
 	duration := time.Since(startTime)
-	_ = duration // Use for monitoring in production
+	if duration > 0 && result.HashesTried > 0 {
+		hashRate := float64(result.HashesTried) / duration.Seconds()
+		w.logHashRate(hashRate, duration, result.HashesTried)
+	}
 
 	return result
+}
+
+// logHashRate logs the hash rate for debugging
+func (w *Worker) logHashRate(hashRate float64, duration time.Duration, hashes uint64) {
+	// Only log periodically to avoid spam (every 10 seconds)
+	if duration >= 10*time.Second {
+		fmt.Printf("[Worker %d] Hashrate: %.2f H/s | Hashes: %d | Duration: %v\n",
+			w.id, hashRate, hashes, duration)
+	}
 }
 
 // handleSuccess handles a successful mining result

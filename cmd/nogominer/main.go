@@ -112,6 +112,10 @@ func main() {
 	statusTicker := time.NewTicker(30 * time.Second)
 	defer statusTicker.Stop()
 
+	// Update stats more frequently for better display (every 5 seconds)
+	statsTicker := time.NewTicker(5 * time.Second)
+	defer statsTicker.Stop()
+
 	// Main loop
 running:
 	for {
@@ -119,15 +123,23 @@ running:
 		case sig := <-sigCh:
 			log.Infof("Received signal %v, shutting down...", sig)
 			break running
+		case <-statsTicker.C:
+			// Update monitor with current stats frequently
+			if miner.IsRunning() {
+				minerStats := miner.GetStats()
+				mon.UpdateHashRate(minerStats.HashRate)
+				mon.UpdateWorkers(minerStats.ActiveWorkers)
+				mon.AddHashes(minerStats.TotalHashes)
+			}
 		case <-statusTicker.C:
 			if !miner.IsRunning() {
 				log.Error("Miner stopped unexpectedly")
 				break running
 			}
-			// Update monitor with current stats
-			minerStats := miner.GetStats()
-			mon.UpdateHashRate(minerStats.HashRate)
-			mon.UpdateWorkers(minerStats.ActiveWorkers)
+			// Log periodic status
+			log.Infof("Miner running normally | Hashrate: %s | Workers: %d",
+				formatHashRate(miner.GetStats().HashRate),
+				miner.GetStats().ActiveWorkers)
 		}
 	}
 

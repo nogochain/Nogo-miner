@@ -141,12 +141,15 @@ func (m *Monitor) display() {
 		m.displayFunc(&stats)
 	}
 
-	// Log statistics
-	m.log.Infof("📊 Hashrate: %s | Accepted: %d | Rejected: %d | Uptime: %s",
+	// Log statistics with detailed hashrate information
+	m.log.Infof("📊 Hashrate: %s (Avg: %s) | Accepted: %d | Rejected: %d | Invalid: %d | Uptime: %s | Workers: %d",
 		formatHashRate(stats.HashRate),
+		formatHashRate(stats.AvgHashRate),
 		stats.AcceptedShares,
 		stats.RejectedShares,
-		formatDuration(stats.Uptime))
+		stats.InvalidShares,
+		formatDuration(stats.Uptime),
+		stats.ActiveWorkers)
 }
 
 // UpdateHashRate updates the hash rate
