@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"net/url"
 	"strings"
@@ -31,14 +32,14 @@ type Client struct {
 
 // MiningJob represents a mining job from pool
 type MiningJob struct {
-	JobID        uint64 `json:"jobId"`
-	Height       uint64 `json:"height"`
-	PrevHash     string `json:"prevHash"`
-	MerkleRoot   string `json:"merkleRoot"`
-	Difficulty   uint32 `json:"difficulty"`
-	ExtraNonce   string `json:"extraNonce"`
-	Timestamp    int64  `json:"timestamp"`
-	MinerAddress string `json:"minerAddress"`
+	JobID        uint64   `json:"jobId"`
+	Height       uint64   `json:"height"`
+	PrevHash     string   `json:"prevHash"`
+	MerkleRoot   string   `json:"merkleRoot"`
+	Difficulty   *big.Int `json:"difficulty"` // Changed to *big.Int
+	ExtraNonce   string   `json:"extraNonce"`
+	Timestamp    int64    `json:"timestamp"`
+	MinerAddress string   `json:"minerAddress"`
 }
 
 // SubmitResult represents a share submission result
@@ -319,7 +320,7 @@ func (c *Client) handleNewJob(msg map[string]interface{}) {
 		Height:       getUint64FromMap(params, "height"),
 		PrevHash:     getStringFromMap(params, "prevHash"),
 		MerkleRoot:   getStringFromMap(params, "merkleRoot"),
-		Difficulty:   uint32(getUint64FromMap(params, "difficulty")),
+		Difficulty:   getBigIntFromMap(params, "difficulty"),
 		ExtraNonce:   getStringFromMap(params, "extraNonce"),
 		Timestamp:    getInt64FromMap(params, "timestamp"),
 		MinerAddress: getStringFromMap(params, "minerAddress"),
@@ -419,6 +420,27 @@ func getStringFromMap(m map[string]interface{}, key string) string {
 		}
 	}
 	return ""
+}
+
+func getBigIntFromMap(m map[string]interface{}, key string) *big.Int {
+	if v, ok := m[key]; ok {
+		switch val := v.(type) {
+		case float64:
+			return big.NewInt(int64(val))
+		case uint64:
+			return new(big.Int).SetUint64(val)
+		case int64:
+			return big.NewInt(val)
+		case int:
+			return big.NewInt(int64(val))
+		case string:
+			// Try parsing as string (for big.Int serialized as string)
+			if bi, ok := new(big.Int).SetString(val, 10); ok {
+				return bi
+			}
+		}
+	}
+	return big.NewInt(0)
 }
 
 func getInt64FromMap(m map[string]interface{}, key string) int64 {

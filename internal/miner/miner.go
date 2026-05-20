@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"math/big"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -335,8 +334,8 @@ func (m *Miner) handleNewJob(job *stratum.MiningJob) {
 	}
 
 	// Convert Stratum job to internal mining job
-	// Convert difficulty from uint32 to *big.Int to match engine API
-	difficulty := big.NewInt(int64(job.Difficulty))
+	// Job difficulty is already *big.Int from stratum client
+	difficulty := job.Difficulty
 
 	// Convert miner address string to []byte
 	minerAddr := []byte(job.MinerAddress)
@@ -355,7 +354,7 @@ func (m *Miner) handleNewJob(job *stratum.MiningJob) {
 	m.currentJob = &MiningJob{
 		Template:   template,
 		StartTime:  time.Now(),
-		Target:     fmt.Sprintf("%d", job.Difficulty),
+		Target:     job.Difficulty.String(),
 		JobID:      fmt.Sprintf("%d", job.JobID),
 		ExtraNonce: job.ExtraNonce,
 		JobIDNum:   job.JobID,

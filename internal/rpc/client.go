@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -32,29 +33,29 @@ type Client struct {
 
 // BlockTemplate represents a block template for mining
 type BlockTemplate struct {
-	Height         uint64        `json:"height"`
-	PrevHash       string        `json:"prevHash"`
-	MerkleRoot     string        `json:"merkleRoot"`
-	Timestamp      int64         `json:"timestamp"`
-	DifficultyBits uint32        `json:"difficultyBits"`
-	MinerAddress   string        `json:"minerAddress"`
+	Height         uint64   `json:"height"`
+	PrevHash       string   `json:"prevHash"`
+	MerkleRoot     string   `json:"merkleRoot"`
+	Timestamp      int64    `json:"timestamp"`
+	DifficultyBits *big.Int `json:"difficultyBits"` // Changed to *big.Int
+	MinerAddress   string   `json:"minerAddress"`
 	Transactions   []Transaction `json:"transactions"`
 	CoinbaseTx     *Transaction  `json:"coinbaseTx"`
-	Target         string        `json:"target"`
-	ChainID        uint64        `json:"chainId"`
+	Target         string   `json:"target"`
+	ChainID        uint64   `json:"chainId"`
 }
 
 // Transaction represents a blockchain transaction
 type Transaction struct {
 	Type      string `json:"type"`
 	ChainID   uint64 `json:"chainId"`
-	FromPubKey string `json:"fromPubKey,omitempty"`
+	FromPubKey []byte `json:"fromPubKey,omitempty"` // Changed to []byte
 	ToAddress string `json:"toAddress"`
 	Amount    uint64 `json:"amount"`
 	Fee       uint64 `json:"fee"`
 	Nonce     uint64 `json:"nonce"`
 	Data      string `json:"data,omitempty"`
-	Signature string `json:"signature,omitempty"`
+	Signature []byte `json:"signature,omitempty"` // Changed to []byte
 }
 
 // SubmitWorkRequest represents a work submission request

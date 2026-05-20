@@ -19,7 +19,7 @@
   "miner": {
     "threads": 4,
     "batch_size": 100,
-    "share_difficulty": 18
+    "share_difficulty": 0
   },
   "logging": {
     "level": "debug",

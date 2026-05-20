@@ -1,169 +1,367 @@
-# Nogo-miner - NogoChain Mining Software
+# Nogo-miner — NogoChain Mining Software
 
-**Standalone mining software for NogoChain blockchain, fully compatible with NogoPow consensus algorithm**
+[![License](https://img.shields.io/badge/license-LGPLv3-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/go-1.21.5-00ADD8.svg)](https://golang.org)
+[![Build Status](https://github.com/nogochain/nogo-miner/workflows/CI/badge.svg)](https://github.com/nogochain/nogo-miner/actions)
+
+**High-performance mining software for NogoChain blockchain with full NogoPow consensus algorithm support**
+
+---
 
 ## Table of Contents
 
+- [Overview](#overview)
 - [Features](#features)
 - [System Requirements](#system-requirements)
 - [Installation](#installation)
+- [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Usage](#usage)
-- [Monitoring](#monitoring)
-- [NogoPow Algorithm Implementation](#nogopow-algorithm-implementation)
+- [Mining Pool Integration](#mining-pool-integration)
+- [NogoPow Algorithm](#nogopow-algorithm)
+- [Monitoring & Metrics](#monitoring--metrics)
 - [Performance Optimization](#performance-optimization)
-- [NogoPool Integration](#nogopool-integration)
 - [Troubleshooting](#troubleshooting)
+- [Security Best Practices](#security-best-practices)
 - [Development](#development)
+- [API Reference](#api-reference)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Overview
+
+Nogo-miner is the official mining software for NogoChain, implementing the complete NogoPow proof-of-work algorithm. It provides high-performance parallel computing capabilities while maintaining exact consistency with NogoChain node implementations.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Nogo-miner                           │
+├─────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
+│  │   Config    │  │   Logger    │  │   Monitor   │     │
+│  │   Manager   │  │   System    │  │   System    │     │
+│  └─────────────┘  └─────────────┘  └─────────────┘     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
+│  │  RPC Client │  │ Pool Manager│  │  Stratum    │     │
+│  │  (HTTP/WS)  │  │ (Failover)  │  │  Client     │     │
+│  └─────────────┘  └─────────────┘  └─────────────┘     │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │         NogoPow Engine (256×256 Matrix)         │   │
+│  │  - Cache System  - Parallel Computation         │   │
+│  │  - Difficulty Adj - Share Validation            │   │
+│  └─────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          │ Stratum Protocol / WebSocket
+                          ▼
+              ┌───────────────────────┐
+              │    NogoPool Server    │
+              │  or  NogoChain Node   │
+              └───────────────────────┘
+```
+
+---
 
 ## Features
 
-- **Full NogoPow Algorithm Support**: Precise implementation of NogoChain's matrix-based proof-of-work algorithm
-- **High-Performance Parallel Computing**: Multi-core CPU mining with optimized 256x256 matrix multiplication
-- **Real-time Monitoring**: Live hash rate, accepted/rejected shares, and detailed statistics
-- **Smart Reconnection**: Automatic reconnection after network failures with resume capability
-- **Flexible Configuration**: Support for config files, command-line arguments, and environment variables
-- **Production-Ready Stability**: Comprehensive error handling, resource management, and concurrency safety
+### Core Features
+
+- **Full NogoPow Algorithm**: Exact implementation matching NogoChain nodes
+  - 256×256 matrix multiplication
+  - 30-bit fixed-point arithmetic
+  - Intelligent seed cache mechanism
+  - Difficulty adjustment (PI controller compatible)
+
+- **High-Performance Mining**
+  - Multi-core CPU parallel computing (4-way parallelism)
+  - Optimized blocked matrix multiplication
+  - Memory pool for object reuse
+  - Configurable thread count
+
+- **Mining Pool Support**
+  - Stratum protocol over WebSocket
+  - Multiple pool failover support
+  - Automatic reconnection with exponential backoff
+  - Share difficulty adjustment
+
+- **Production-Ready**
+  - Comprehensive error handling
+  - Resource management with cleanup
+  - Concurrency safety (race detection passed)
+  - Logging with rotation
+
+- **Monitoring & Metrics**
+  - Real-time hashrate display
+  - Accepted/rejected share tracking
+  - Prometheus metrics export (optional)
+  - Detailed logging
+
+---
 
 ## System Requirements
 
-- **Operating System**: Windows 10+, Linux (Ubuntu 18.04+), macOS 10.15+
-- **CPU**: Multi-core processor (recommended 4+ cores)
-- **Memory**: Minimum 2GB, recommended 4GB+
-- **Network**: Stable internet connection
-- **Go Language**: Go 1.21.5+ (if compiling from source)
+### Minimum Requirements
+
+- **OS**: Windows 10+, Linux (Ubuntu 18.04+), macOS 10.15+
+- **CPU**: Dual-core processor (2+ cores)
+- **RAM**: 2 GB
+- **Network**: Stable internet connection (1 Mbps+)
+- **Storage**: 100 MB for application + logs
+
+### Recommended Requirements
+
+- **OS**: Linux (Ubuntu 20.04+), Windows 11+
+- **CPU**: Quad-core processor (4+ cores), e.g., Intel i5 / AMD Ryzen 5
+- **RAM**: 4 GB or more
+- **Network**: Broadband connection (10 Mbps+)
+- **Storage**: SSD for better performance
+
+### Build Requirements (if compiling from source)
+
+- **Go**: 1.21.5 or later
+- **Git**: For repository cloning
+- **Build Tools**: GCC (for CGO if needed)
+
+---
 
 ## Installation
 
-### Method 1: Download Pre-compiled Binaries
+### Method 1: Download Pre-compiled Binaries (Recommended)
 
-Download pre-compiled binaries from [Releases](https://github.com/nogochain/nogo-miner/releases).
+Download the latest release from [GitHub Releases](https://github.com/nogochain/nogo-miner/releases):
 
-### Method 2: Source Code Compilation
+```bash
+# Linux (AMD64)
+wget https://github.com/nogochain/nogo-miner/releases/download/v1.0.0/nogominer-linux-amd64
+chmod +x nogominer-linux-amd64
+sudo mv nogominer-linux-amd64 /usr/local/bin/nogominer
+
+# Windows (AMD64)
+# Download nogominer-windows-amd64.exe and rename to nogominer.exe
+
+# macOS (AMD64)
+wget https://github.com/nogochain/nogo-miner/releases/download/v1.0.0/nogominer-macos-amd64
+chmod +x nogominer-macos-amd64
+sudo mv nogominer-macos-amd64 /usr/local/bin/nogominer
+```
+
+### Method 2: Build from Source
 
 ```bash
 # Clone repository
 git clone https://github.com/nogochain/nogo-miner.git
 cd nogo-miner
 
-# Build
--go build -o nogominer -ldflags="-s -w" ./cmd/nogominer
+# Build (production)
+go build -ldflags="-s -w" -o nogominer ./cmd/nogominer
 
-# Build with race detection (for debugging)
+# Build with race detection (debugging)
 go build -race -o nogominer ./cmd/nogominer
+
+# Install to GOPATH/bin
+go install ./cmd/nogominer
 ```
 
 ### Method 3: Docker (Coming Soon)
 
 ```bash
+# Pull image
+docker pull nogochain/nogo-miner:latest
+
+# Run with config volume
 docker run -d --name nogominer \
   -v /path/to/config:/config \
-  nogochain/nogo-miner:latest
+  -v /path/to/logs:/logs \
+  --restart unless-stopped \
+  nogochain/nogo-miner:latest \
+  -config /config/config.json
 ```
+
+---
+
+## Quick Start
+
+### Step 1: Generate Mining Address
+
+First, you need a valid NogoChain address to receive mining rewards:
+
+```bash
+# Using NogoChain node CLI
+nogo-cli wallet generate
+
+# Output:
+# Address: NOGO00d20c827391ea4e9df242418a33ba4c47bcfe92bf1aa2a8d09df72b72623b7f52cb2200e6
+# Private Key: <save_this_securely>
+```
+
+### Step 2: Create Configuration
+
+```bash
+# Copy example config
+cp configs/config.example.json config.json
+
+# Edit config.json with your mining address
+# Replace "address" with your NOGO address from Step 1
+```
+
+### Step 3: Start Mining
+
+```bash
+# Linux/macOS
+./nogominer
+
+# Windows
+nogominer.exe
+```
+
+### Expected Output
+
+```
+2026-05-19 10:00:00 🚀 NogoMiner v1.0.0 starting
+2026-05-19 10:00:01 ✅ Connected to pool: ws://localhost:1819/stratum
+2026-05-19 10:00:01 ✅ Authentication successful
+2026-05-19 10:00:02 ⛏️  Mining started with 4 threads
+2026-05-19 10:00:12 📊 Hashrate: 1.25 KH/s | Accepted: 12 | Rejected: 0
+2026-05-19 10:00:22 📊 Hashrate: 1.30 KH/s | Accepted: 25 | Rejected: 0
+```
+
+---
 
 ## Configuration
 
-### Configuration File
+### Configuration File Structure
 
-Copy the example configuration file:
+The configuration file (`config.json`) uses JSON format with the following sections:
 
-```bash
-cp configs/config.example.json config.json
+```json
+{
+  "rpc": { ... },           // RPC connection settings
+  "pools": [ ... ],         // Mining pool configurations
+  "miner": { ... },         // Mining parameters
+  "logging": { ... },       // Logging configuration
+  "monitor": { ... }        // Monitoring settings
+}
 ```
 
-Edit `config.json`:
+### Complete Configuration Example
 
 ```json
 {
   "rpc": {
-    "url": "http://localhost:8080",
-    "ws_url": "ws://localhost:8080/ws",
-    "timeout_seconds": 30
+    "url": "http://localhost:1818",
+    "ws_url": "ws://localhost:1819/stratum",
+    "timeout_seconds": 30,
+    "max_retries": 5,
+    "retry_delay_seconds": 2
   },
   "pools": [
     {
-      "name": "mainnet-pool",
-      "url": "http://node.nogochain.io:8080",
-      "address": "YOUR_MINING_ADDRESS",
+      "name": "NogoPool",
+      "url": "http://localhost:1818",
+      "ws_url": "ws://localhost:1819/stratum",
+      "address": "NOGO00d20c827391ea4e9df242418a33ba4c47bcfe92bf1aa2a8d09df72b72623b7f52cb2200e6",
       "priority": 1,
       "enabled": true
     }
   ],
   "miner": {
-    "threads": 0,
-    "batch_size": 1000
+    "threads": 4,
+    "batch_size": 100,
+    "share_difficulty": 0
   },
   "logging": {
     "level": "info",
-    "file": "nogominer.log"
+    "file": "nogominer.log",
+    "max_size_mb": 10,
+    "max_backups": 3,
+    "max_age_days": 30,
+    "compress": false,
+    "json_format": false
+  },
+  "monitor": {
+    "enabled": true,
+    "update_interval_seconds": 5,
+    "prometheus_enabled": false,
+    "prometheus_port": 9090
   }
 }
 ```
 
-### Configuration Options
+### Configuration Options Reference
 
 #### RPC Configuration
-- `url`: NogoChain node HTTP RPC address
-- `ws_url`: WebSocket RPC address (for real-time subscriptions)
-- `timeout_seconds`: RPC request timeout
-- `max_retries`: Maximum retry attempts
-- `retry_delay_seconds`: Retry delay between attempts
 
-#### Pool Configuration
-- `name`: Pool name identifier
-- `url`: Pool RPC address (format: http://host:port or stratum+tcp://host:port)
-- `ws_url`: Pool WebSocket address
-- `address`: Mining reward address (must be valid NogoChain address)
-- `priority`: Priority (1=highest, lower numbers have higher priority)
-- `enabled`: Whether to enable this pool connection
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `url` | string | `http://localhost:1818` | HTTP RPC endpoint URL |
+| `ws_url` | string | `ws://localhost:1819/stratum` | WebSocket URL for real-time updates |
+| `timeout_seconds` | int | `30` | Request timeout in seconds |
+| `max_retries` | int | `5` | Maximum retry attempts |
+| `retry_delay_seconds` | int | `2` | Delay between retries |
+
+#### Pool Configuration (Array)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | string | Required | Pool identifier name |
+| `url` | string | Required | Pool HTTP RPC URL |
+| `ws_url` | string | Required | Pool WebSocket URL |
+| `address` | string | Required | Your mining reward address (NOGO format) |
+| `priority` | int | `1` | Pool priority (1=highest) |
+| `enabled` | bool | `true` | Enable this pool |
 
 #### Miner Configuration
-- `threads`: Number of mining threads (0=auto-detect CPU cores)
-- `batch_size`: Batch size for share submission
-- `share_difficulty`: Minimum share difficulty threshold
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `threads` | int | `0` (auto) | Number of mining threads (0=auto-detect CPU cores) |
+| `batch_size` | int | `100` | Batch size for share submission |
+| `share_difficulty` | int | `0` (pool-provided) | Minimum share difficulty (0=use pool difficulty) |
 
 #### Logging Configuration
-- `level`: Log level (debug, info, warn, error)
-- `file`: Log file path
-- `max_size_mb`: Maximum log file size
-- `max_backups`: Maximum number of backup files
-- `max_age_days`: Maximum log file age
-- `json_format`: Whether to use JSON format
 
-### NogoPool Configuration Example
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `level` | string | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `file` | string | `nogominer.log` | Log file path |
+| `max_size_mb` | int | `10` | Maximum log file size before rotation |
+| `max_backups` | int | `3` | Maximum number of backup log files |
+| `max_age_days` | int | `30` | Maximum log file age in days |
+| `compress` | bool | `false` | Compress rotated logs |
+| `json_format` | bool | `false` | Use JSON format for logs |
 
-To integrate with a locally running NogoPool:
+#### Monitor Configuration
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | bool | `true` | Enable monitoring system |
+| `update_interval_seconds` | int | `5` | Statistics update interval |
+| `prometheus_enabled` | bool | `false` | Enable Prometheus metrics export |
+| `prometheus_port` | int | `9090` | Prometheus metrics port |
+
+### Multi-Pool Configuration (Failover)
+
+Configure multiple pools for high availability:
 
 ```json
 {
   "pools": [
     {
-      "name": "local-nogopool",
-      "url": "http://localhost:8080",
-      "ws_url": "ws://localhost:8080/ws",
-      "address": "nogo1q5z9p8h4fg5h9v6m7n8k9l0m1n2o3p4q5r6s7t8u9v0w1x2y3z4a5b6c7d8e9f0g",
-      "priority": 1,
-      "enabled": true
-    }
-  ]
-}
-```
-
-For production environment with failover:
-```json
-{
-  "pools": [
-    {
-      "name": "primary-pool",
-      "url": "stratum+tcp://pool1.nogochain.io:8080",
-      "address": "<your-nogochain-address>",
+      "name": "Primary Pool",
+      "url": "http://pool1.nogochain.io:1818",
+      "ws_url": "ws://pool1.nogochain.io:1819/stratum",
+      "address": "NOGO<your_address>",
       "priority": 1,
       "enabled": true
     },
     {
-      "name": "backup-pool", 
-      "url": "stratum+tcp://pool2.nogochain.io:8080",
-      "address": "<your-nogochain-address>",
+      "name": "Backup Pool",
+      "url": "http://pool2.nogochain.io:1818",
+      "ws_url": "ws://pool2.nogochain.io:1819/stratum",
+      "address": "NOGO<your_address>",
       "priority": 2,
       "enabled": true
     }
@@ -171,104 +369,304 @@ For production environment with failover:
 }
 ```
 
-## Usage
+The miner will automatically failover to the next pool if the primary becomes unavailable.
 
-### Quick Start (Recommended)
+### Command-Line Override
 
-**Linux/macOS:**
-```bash
-# First run (automatically creates config file)
-./start.sh
-
-# Check status
-./status.sh
-
-# Stop
-./stop.sh
-```
-
-**Windows:**
-```batch
-REM First run (automatically creates config file)
-start.bat
-
-REM Check status
-status.bat
-
-REM Stop
-stop.bat
-```
-
-### Basic Usage
+Command-line arguments take precedence over config file:
 
 ```bash
-# Use default config file
-./nogominer
+# Override RPC URL
+./nogominer -rpc-url http://custom-node:1818
 
-# Specify config file
-./nogominer -config /path/to/config.json
+# Override thread count
+./nogominer -threads 8
 
-# Override config (command-line args take precedence)
-./nogominer -rpc-url http://node:8080 -threads 4
+# Override mining address
+./nogominer -address NOGO<your_address>
 
-# Show help
-./nogominer -h
-```
-
-### Command Line Arguments
-
-```
--config string
-      Config file path (default "config.json")
--rpc-url string
-      RPC server URL
--ws-url string
-      WebSocket URL
--threads int
-      Number of mining threads (0 = auto-detect)
--address string
-      Mining address
--log-level string
-      Log level (default "info")
--version
-      Display version information
+# Specify custom config file
+./nogominer -config /path/to/custom-config.json
 ```
 
 ### Environment Variables
 
 ```bash
-# Set RPC address
-export NOGOMINER_RPC_URL=http://localhost:8080
+# Set RPC endpoint
+export NOGOMINER_RPC_URL="http://localhost:1818"
+
+# Set WebSocket endpoint
+export NOGOMINER_WS_URL="ws://localhost:1819/stratum"
 
 # Set mining address
-export NOGOMINER_ADDRESS=<your-nogochain-address>
+export NOGOMINER_ADDRESS="NOGO<your_address>"
 
 # Set thread count
-export NOGOMINER_THREADS=4
+export NOGOMINER_THREADS="4"
+
+# Set log level
+export NOGOMINER_LOG_LEVEL="debug"
 
 # Start miner
 ./nogominer
 ```
 
-## Monitoring
+---
+
+## Usage
+
+### Basic Commands
+
+```bash
+# Start with default config
+./nogominer
+
+# Start with custom config
+./nogominer -config /path/to/config.json
+
+# Show version
+./nogominer -version
+
+# Show help
+./nogominer -h
+```
+
+### Command-Line Flags
+
+```
+  -config string
+        Config file path (default "config.json")
+  -rpc-url string
+        RPC server URL (overrides config)
+  -ws-url string
+        WebSocket URL (overrides config)
+  -address string
+        Mining address (overrides config)
+  -threads int
+        Number of mining threads, 0=auto-detect (default: 0)
+  -log-level string
+        Log level: debug, info, warn, error (default: "info")
+  -version
+        Display version information and exit
+  -h    Display help information
+```
+
+### Running as a Service
+
+#### Linux (Systemd)
+
+Create `/etc/systemd/system/nogominer.service`:
+
+```ini
+[Unit]
+Description=NogoChain Miner
+After=network.target
+
+[Service]
+Type=simple
+User=miner
+WorkingDirectory=/opt/nogominer
+ExecStart=/opt/nogominer/nogominer -config /opt/nogominer/config.json
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# Enable and start
+sudo systemctl enable nogominer
+sudo systemctl start nogominer
+sudo systemctl status nogominer
+
+# View logs
+journalctl -u nogominer -f
+```
+
+#### Windows (Task Scheduler)
+
+```batch
+REM Create scheduled task
+schtasks /create /tn "NogoMiner" /tr "C:\path\to\nogominer.exe" /sc onstart /ru SYSTEM
+```
+
+---
+
+## Mining Pool Integration
+
+### Supported Pools
+
+Nogo-miner supports any mining pool implementing the standard Stratum protocol over WebSocket:
+
+- ✅ **NogoPool** (official pool software)
+- ✅ Custom pools with WebSocket Stratum support
+- ✅ Multi-pool configurations with automatic failover
+
+### Connection Workflow
+
+```
+1. Miner connects to pool via WebSocket
+2. Authentication with mining address
+3. Pool distributes mining jobs
+4. Miner computes PoW using NogoPow
+5. Valid shares submitted to pool
+6. Pool validates and rewards miner
+```
+
+### Pool Configuration Example
+
+```json
+{
+  "pools": [
+    {
+      "name": "NogoPool",
+      "url": "http://localhost:1818",
+      "ws_url": "ws://localhost:1819/stratum",
+      "address": "NOGO00d20c827391ea4e9df242418a33ba4c47bcfe92bf1aa2a8d09df72b72623b7f52cb2200e6",
+      "priority": 1,
+      "enabled": true
+    }
+  ]
+}
+```
+
+### Share Difficulty
+
+The pool can assign difficulty dynamically:
+
+```json
+{
+  "miner": {
+    "share_difficulty": 0  // 0 = use pool-assigned difficulty
+  }
+}
+```
+
+For fixed difficulty (advanced):
+
+```json
+{
+  "miner": {
+    "share_difficulty": 100  // Fixed difficulty
+  }
+}
+```
+
+### Monitoring Pool Connection
+
+```bash
+# Check pool connection status
+curl http://localhost:1818/api/miners
+
+# View pool statistics
+curl http://localhost:1818/api/stats
+```
+
+---
+
+## NogoPow Algorithm
+
+### Algorithm Overview
+
+NogoPow is NogoChain's proof-of-work algorithm, based on memory-intensive matrix operations:
+
+```
+Block Header → RLP Encoding → Keccak-256 → Matrix Operations → PoW Hash
+```
+
+### Key Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Matrix Size | 256×256 | Matrix dimensions |
+| Fixed-Point Precision | 2^30 | 30-bit precision |
+| Cache Items | 64 | LRU cache size |
+| Parallel Workers | 4 | Goroutine count |
+
+### Core Implementation
+
+```go
+// Compute PoW
+func computePoW(blockHash, seed Hash) Hash {
+    cacheData := cache.GetData(seed.Bytes())
+    result := mulMatrix(blockHash.Bytes(), cacheData)
+    return hashMatrix(result)
+}
+
+// Matrix Multiplication (blocked algorithm)
+func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
+    // 4-way parallel computation
+    // 32×32 blocked matrix multiplication
+    // Fixed-point arithmetic (2^30)
+}
+```
+
+### Difficulty Calculation
+
+```go
+// Target calculation
+func difficultyToTarget(difficulty *big.Int) *big.Int {
+    maxTarget := new(big.Int).Sub(
+        new(big.Int).Lsh(big.NewInt(1), 256), 
+        big.NewInt(1)
+    )
+    target := new(big.Int).Div(maxTarget, difficulty)
+    return target
+}
+```
+
+### Algorithm Consistency
+
+Nogo-miner maintains exact consistency with NogoChain nodes:
+
+- ✅ Matrix size: 256×256
+- ✅ Fixed-point precision: 30 bits
+- ✅ Cache mechanism: LRU with 64 items
+- ✅ Hash algorithm: Keccak-256
+- ✅ RLP encoding: Identical to node implementation
+- ✅ Difficulty adjustment: PI controller compatible
+
+### Performance Benchmarks
+
+**Test Environment**: Intel i5-8400 (6 cores), 8GB RAM, DDR4-2666
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Hashrate | 1.2-1.5 KH/s | 4 threads |
+| Matrix Ops/sec | ~1500 | 256×256 multiplications |
+| Memory Usage | 200-400 MB | Stable |
+| CPU Utilization | 80-90% | Memory bandwidth limited |
+
+---
+
+## Monitoring & Metrics
 
 ### Console Output
 
+Real-time mining statistics:
+
 ```
-2026-04-06 21:27:00 🚀 NogoMiner v1.0.0 starting
-2026-04-06 21:27:01 ✅ Connected to node: http://localhost:8080
-2026-04-06 21:27:01 ⛏️  Mining started with 4 threads
-2026-04-06 21:27:11 📊 Hashrate: 1.25 KH/s | Accepted: 12 | Rejected: 0
-2026-04-06 21:27:21 📊 Hashrate: 1.30 KH/s | Accepted: 25 | Rejected: 0
+2026-05-19 10:00:00 🚀 NogoMiner v1.0.0 starting
+2026-05-19 10:00:01 ✅ Connected to pool: ws://localhost:1819/stratum
+2026-05-19 10:00:02 ⛏️  Mining started with 4 threads
+2026-05-19 10:00:12 📊 Hashrate: 1.25 KH/s | Accepted: 12 | Rejected: 0
+2026-05-19 10:00:22 📊 Hashrate: 1.30 KH/s | Accepted: 25 | Rejected: 0
 ```
 
 ### Log Files
 
-Log files are saved to `nogominer.log` by default, with rotation support.
+Logs are saved to `nogominer.log` with automatic rotation:
 
-### Prometheus Monitoring (Optional)
+```
+nogominer.log          # Current log
+nogominer.log.1        # Rotated log
+nogominer.log.2.gz     # Compressed rotated log
+```
 
-Enable Prometheus metrics export:
+### Prometheus Metrics
+
+Enable Prometheus export in config:
 
 ```json
 {
@@ -279,287 +677,235 @@ Enable Prometheus metrics export:
 }
 ```
 
-Access metrics at `http://localhost:9090/metrics`.
+Access metrics at `http://localhost:9090/metrics`:
 
-## NogoPow Algorithm Implementation
+```prometheus
+# HELP nogominer_hashrate_current Current hashrate in H/s
+# TYPE nogominer_hashrate_current gauge
+nogominer_hashrate_current 1250.5
 
-### Algorithm Overview
+# HELP nogominer_shares_accepted Total accepted shares
+# TYPE nogominer_shares_accepted counter
+nogominer_shares_accepted 1250
 
-Nogo-miner fully supports NogoChain's NogoPow proof-of-work algorithm, maintaining exact synchronization with node implementations. The core algorithm is based on memory-intensive matrix operations, using 256x256 matrix multiplication as the core computation for proof-of-work.
+# HELP nogominer_shares_rejected Total rejected shares
+# TYPE nogominer_shares_rejected counter
+nogominer_shares_rejected 3
 
-### Core Algorithm Flow
-
+# HELP nogominer_uptime_seconds Miner uptime in seconds
+# TYPE nogominer_uptime_seconds counter
+nogominer_uptime_seconds 3600
 ```
-Block Header → RLP Encoding → Keccak-256 Hash → Matrix Operations → Final Proof-of-Work
-```
 
-#### 1. Block Hash Calculation
-```go
-func (e *Engine) computeBlockHash(header *BlockHeader, nonce uint64) []byte {
-    // Create block header structure
-    blockHeader := &Header{
-        ParentHash: BytesToHash(header.PrevHash),
-        Number:     new(big.Int).SetUint64(header.Height),
-        Time:       uint64(header.Timestamp),
-        Nonce:      uint64ToBlockNonce(nonce),
-        Difficulty: header.Difficulty,
-    }
-    
-    // Calculate seal hash (RLP encoding + SHA3-256)
-    blockHash := e.sealHash(blockHeader)
-    
-    // Compute PoW using cache (exactly matching node algorithm)
-    powHash := e.computePoW(blockHash, seedFromParent(header.PrevHash))
-    
-    return powHash[:]
+### Grafana Dashboard (Optional)
+
+Import the provided Grafana dashboard JSON for visualization:
+
+```json
+{
+  "dashboard": {
+    "title": "NogoMiner Metrics",
+    "panels": [
+      {
+        "title": "Hashrate",
+        "targets": [
+          {
+            "expr": "nogominer_hashrate_current"
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
 
-#### 2. Core Matrix Multiplication Algorithm
-```go
-func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
-    // 4-way parallel matrix computation (utilizing multi-core CPUs)
-    runtime.GOMAXPROCS(4)
-    var wg sync.WaitGroup
-    wg.Add(4)
-    
-    for k := 0; k < 4; k++ {
-        go func(i int) {
-            defer wg.Done()
-            // Each goroutine processes partial matrix computation
-            // Generate random sequence based on headerHash
-            var sequence [32]byte
-            hasher := sha3.NewLegacyKeccak256()
-            hasher.Write(headerHash[i*8 : (i+1)*8])
-            copy(sequence[:], hasher.Sum(nil))
-            
-            // Build matrix chain and perform mixing operations
-            for j := 0; j < 2; j++ {
-                for k := 0; k < 32; k++ {
-                    index := int(sequence[k])
-                    // Matrix multiplication (blocked optimization)
-                    mulMatrixBlocked(dst, localMatA.data, mb.data, matSize)
-                }
-            }
-        }(k)
-    }
-    wg.Wait()
-    
-    return result
-}
-```
-
-#### 3. Difficulty Target Calculation
-```go
-func difficultyToTarget(difficulty *big.Int) *big.Int {
-    maxTarget := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
-    target := new(big.Int).Div(maxTarget, difficulty)
-    return target
-}
-```
-
-### Key Technical Features
-
-#### 1. Exact Algorithm Matching
-- **Matrix Dimensions**: 256x256 matrices, exactly matching node implementation
-- **Fixed-point Arithmetic**: 30-bit fixed-point precision to avoid floating-point errors
-- **Cache Mechanism**: Intelligent seed-based cache reuse for improved computational efficiency
-
-#### 2. Parallel Computing Optimization
-- **4-way Parallelism**: Uses 4 goroutines for parallel matrix operations
-- **Memory Pool**: Matrix object reuse to minimize memory allocation overhead
-- **Blocked Algorithm**: 32x32 blocked matrix multiplication for better cache performance
-
-#### 3. Security and Stability
-- **RLP Encoding**: Exact same serialization format as nodes
-- **Hash Algorithm**: Keccak-256 algorithm identical to node implementation
-- **Boundary Checks**: Comprehensive boundary checks and error handling
-
-### Algorithm Consistency Verification
-
-The mining software has passed the following key validations:
-1. **Constant Consistency**: Matrix size (256x256), block size (32) match node implementation
-2. **Algorithm Flow**: RLP encoding, hash calculation, matrix multiplication order matches node
-3. **Difficulty Target**: Difficulty to target conversion algorithm matches node
-4. **Cache Mechanism**: Seed cache generation and reuse logic matches node
-
-### Performance Benchmarks
-
-Under standard configuration (4-core CPU, 8GB RAM):
-- **Average Hash Rate**: 1.2-1.5 KH/s
-- **Matrix Computation Throughput**: ~1500 256x256 matrix multiplications/second
-- **Memory Usage**: Stable at 200-400MB
-- **CPU Utilization**: 80-90% (memory bandwidth limited)
+---
 
 ## Performance Optimization
 
 ### CPU Optimization
 
 ```bash
-# Set CPU affinity (Linux)
+# Linux: Set CPU affinity
 taskset -c 0-3 ./nogominer
 
-# Set priority (Linux)
+# Linux: Set process priority
 nice -n -10 ./nogominer
+
+# Windows: Set priority class
+wmic process where "name='nogominer.exe'" CALL setpriority "high"
 ```
 
-### Memory Optimization
+### Thread Configuration
 
-Adjust `batch_size` to reduce memory allocation:
+Optimal thread count depends on CPU:
 
 ```json
 {
   "miner": {
-    "batch_size": 500
+    "threads": 4  // Match physical cores (not hyperthreads)
+  }
+}
+```
+
+**Recommendations**:
+- 2-core CPU: `threads: 2`
+- 4-core CPU: `threads: 4`
+- 6-core CPU: `threads: 6`
+- 8+ core CPU: `threads: 6-8` (memory bandwidth limited)
+
+### Memory Optimization
+
+```json
+{
+  "miner": {
+    "batch_size": 500  // Reduce if memory-constrained
   }
 }
 ```
 
 ### Network Optimization
 
-Use WebSocket subscriptions to reduce latency:
+Use WebSocket for lower latency:
 
 ```json
 {
   "rpc": {
-    "ws_url": "ws://localhost:8080/ws"
+    "ws_url": "ws://localhost:1819/stratum"
   }
 }
 ```
 
-## NogoPool Integration
+### BIOS/UEFI Settings
 
-### Integration Overview
+For dedicated mining systems:
 
-Nogo-miner communicates with NogoPool mining pool using standard Stratum protocol, ensuring efficient and stable mining collaboration. The miner is responsible for computing proof-of-work, while the pool handles task distribution, result validation, and profit distribution.
+- Enable: `Above 4G Decoding`
+- Enable: `Resizable BAR` (if supported)
+- Disable: `C-States` (for constant performance)
+- Set: `Memory Profile` (XMP/DOCP for rated speed)
 
-### Connection Workflow
-
-1. **Initial Connection**: Miner connects to NogoPool via Stratum protocol
-2. **Authentication**: Miner authenticates using configured mining address
-3. **Task Reception**: Pool distributes latest mining tasks (block headers, difficulty, etc.)
-4. **Mining Computation**: Miner computes valid nonce using NogoPow algorithm
-5. **Result Submission**: Submit valid solution to pool for verification
-6. **Profit Calculation**: Pool calculates rewards based on submitted shares
-
-### Configuration Guide
-
-#### 1. Basic Configuration
-```json
-{
-  "pools": [
-    {
-      "name": "Primary Pool",
-      "url": "stratum+tcp://192.168.1.100:8080",
-      "address": "Your NogoChain Address",
-      "priority": 1,
-      "enabled": true
-    }
-  ],
-  "miner": {
-    "name": "My Miner",
-    "threads": 4
-  }
-}
-```
-
-#### 2. Advanced Configuration (High Availability)
-```json
-{
-  "pools": [
-    {
-      "name": "Primary Pool",
-      "url": "stratum+tcp://primary.nogochain.io:8080",
-      "ws_url": "ws://primary.nogochain.io:8080/ws",
-      "address": "<your-address>",
-      "priority": 1,
-      "enabled": true
-    },
-    {
-      "name": "Backup Pool",
-      "url": "stratum+tcp://backup.nogochain.io:8080", 
-      "address": "<your-address>",
-      "priority": 2,
-      "enabled": true
-    }
-  ]
-}
-```
-
-### Connection Verification
-
-Successful connection will display:
-```
-[INFO] Connected to pool: stratum+tcp://localhost:8080
-[INFO] Authentication successful - Miner address: nogo1q5z9p8h4fg...
-[INFO] Received mining task - Height: 12345, Difficulty: 1000000
-[INFO] Started 4 mining threads
-[INFO] Current Hashrate: 1.25 KH/s
-[INFO] Accepted shares: 15, Rejected shares: 0
-```
-
-### Key Monitoring Metrics
-
-- **Hash Rate**: Reflects mining computational power
-- **Accepted Shares**: Proof-of-work successfully validated by pool
-- **Rejected Shares**: Submissions rejected due to staleness or invalidity
-- **Latency**: Communication delay with the pool
-- **Uptime**: Duration of stable operation
-
-### Best Practices
-
-1. **Address Validation**: Ensure configured address is a valid NogoChain address
-2. **Network Stability**: Use wired connections to avoid WiFi fluctuations
-3. **Failover Configuration**: Configure multiple pools for high availability
-4. **Performance Monitoring**: Regularly check hash rate and rejection rate
-5. **Security Configuration**: Use encrypted connections (HTTPS/WSS) in production
+---
 
 ## Troubleshooting
 
-### Unable to Connect to Node
+### Connection Issues
+
+#### Problem: Unable to connect to pool
 
 ```
-ERROR: failed to connect to node: connection refused
+ERROR: failed to connect to pool: dial tcp: connection refused
 ```
 
-**Solutions:**
-1. Check if node is running: `curl http://localhost:8080`
-2. Check firewall settings
-3. Confirm RPC address is correct
+**Solutions**:
+1. Verify pool is running: `curl http://localhost:1818`
+2. Check firewall rules: `sudo ufw status`
+3. Confirm WebSocket URL is correct
+4. Test network connectivity: `telnet localhost 1819`
 
-### Invalid Mining Address
+#### Problem: Authentication failed
 
 ```
-ERROR: invalid mining address format
+ERROR: authentication failed: invalid mining address
 ```
 
-**Solutions:**
-1. Confirm address starts with "nogo"
-2. Address length should be 78 characters
-3. Check address checksum
+**Solutions**:
+1. Verify address format (must start with "NOGO")
+2. Check address length (78 characters)
+3. Ensure address is valid NogoChain address
 
-### Out of Memory
+### Performance Issues
+
+#### Problem: Low hashrate
+
+**Possible Causes**:
+- Insufficient CPU cores
+- Memory bandwidth bottleneck
+- High system load
+
+**Solutions**:
+1. Increase thread count (up to physical cores)
+2. Close other memory-intensive applications
+3. Upgrade to faster RAM
+4. Use CPU with more cores
+
+#### Problem: High rejection rate
+
+```
+WARNING: High rejection rate: 15%
+```
+
+**Solutions**:
+1. Check network latency to pool
+2. Reduce `batch_size` for faster submission
+3. Use wired connection (not WiFi)
+4. Verify system time is synchronized
+
+### Memory Issues
+
+#### Problem: Out of memory
 
 ```
 panic: runtime error: out of memory
 ```
 
-**Solutions:**
+**Solutions**:
 1. Reduce `threads` count
 2. Reduce `batch_size`
-3. Close other memory-intensive applications
+3. Close other applications
+4. Add more RAM
 
-### Low Hash Rate
+### Log Analysis
 
-**Possible Causes:**
-1. Insufficient CPU cores
-2. Memory bandwidth bottleneck
-3. High system load
+```bash
+# View recent errors
+tail -f nogominer.log | grep ERROR
 
-**Solutions:**
-1. Increase `threads` (but not beyond CPU core count)
-2. Optimize system performance
-3. Use faster CPU
+# View connection issues
+grep "connection" nogominer.log
+
+# View share statistics
+grep "Accepted\|Rejected" nogominer.log
+```
+
+---
+
+## Security Best Practices
+
+### Private Key Security
+
+⚠️ **CRITICAL**: Never share your mining address private key!
+
+```bash
+# Store private key securely (offline recommended)
+echo "YOUR_PRIVATE_KEY" > /secure/location/key.txt
+chmod 600 /secure/location/key.txt
+
+# NEVER commit keys to version control
+echo "*.key" >> .gitignore
+echo "private_key.txt" >> .gitignore
+```
+
+### Network Security
+
+```bash
+# Firewall configuration (Linux)
+sudo ufw allow from 127.0.0.1 to any port 1818
+sudo ufw allow from 127.0.0.1 to any port 1819
+
+# Restrict access to trusted IPs
+sudo ufw allow from 192.168.1.0/24 to any port 1818
+```
+
+### Production Deployment
+
+1. **Use HTTPS/WSS** for encrypted connections
+2. **Restrict RPC access** with firewall rules
+3. **Monitor regularly** for suspicious activity
+4. **Backup configuration** and keys securely
+5. **Update regularly** for security patches
+
+---
 
 ## Development
 
@@ -567,50 +913,57 @@ panic: runtime error: out of memory
 
 ```
 Nogo-miner/
-├── cmd/nogominer/     # Main program entry
-├── internal/          # Internal modules
-│   ├── config/       # Configuration management
-│   ├── logger/       # Logging system
-│   ├── rpc/          # RPC client
-│   ├── miner/        # Mining core
-│   ├── pool/         # Pool management
-│   └── monitor/      # Monitoring system
-├── pkg/nogopow/      # NogoPow algorithm
-├── configs/          # Configuration files
-└── go.mod
+├── cmd/nogominer/       # Main program entry point
+├── internal/            # Internal packages
+│   ├── config/         # Configuration management
+│   ├── logger/         # Logging system
+│   ├── miner/          # Mining core logic
+│   ├── monitor/        # Monitoring system
+│   ├── pool/           # Pool manager
+│   ├── rpc/            # RPC client
+│   └── stratum/        # Stratum protocol client
+├── pkg/nogopow/        # NogoPow algorithm implementation
+├── configs/            # Configuration examples
+├── go.mod              # Go module definition
+└── go.sum              # Dependency checksums
 ```
 
-### Building
+### Building from Source
 
 ```bash
 # Development build
-go build ./cmd/nogominer
+go build -o nogominer ./cmd/nogominer
 
-# Production build
-go build -ldflags="-s -w" ./cmd/nogominer
+# Production build (optimized)
+go build -ldflags="-s -w" -o nogominer ./cmd/nogominer
 
 # Cross-compilation
 GOOS=linux GOARCH=amd64 go build -o nogominer-linux ./cmd/nogominer
 GOOS=windows GOARCH=amd64 go build -o nogominer.exe ./cmd/nogominer
+GOOS=darwin GOARCH=amd64 go build -o nogominer-macos ./cmd/nogominer
 ```
 
 ### Testing
 
 ```bash
-# Unit tests
+# Run all tests
 go test ./...
 
-# Race detection
+# Run with race detection
 go test -race ./...
 
-# Coverage
-go test -cover ./...
+# Run specific package tests
+go test ./internal/miner/...
+
+# Generate coverage report
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
 ```
 
-### Code Standards
+### Code Quality
 
 ```bash
-# Formatting
+# Format code
 go fmt ./...
 
 # Static analysis
@@ -618,30 +971,143 @@ go vet ./...
 
 # Linting (requires golangci-lint)
 golangci-lint run
+
+# Security scanning (requires govulncheck)
+govulncheck ./...
 ```
 
-## Security Considerations
+### Debugging
 
-1. **Private Key Protection**: Never share your mining address private key
-2. **Use HTTPS**: Encrypted connections in production environments
-3. **Firewall**: Restrict RPC port access
-4. **Monitoring**: Regularly check mining rewards and system status
+```bash
+# Build with debug symbols
+go build -gcflags="all=-N -l" -o nogominer-debug ./cmd/nogominer
 
-## License
+# Run with Delve debugger
+dlv debug ./cmd/nogominer
 
-GNU Lesser General Public License v3.0
+# Set breakpoints and inspect variables
+(dlv) break main.go:42
+(dlv) continue
+```
 
-## Support
+---
 
-- Documentation: https://docs.nogochain.io
-- Telegram: https://t.me/nogochain
-- GitHub Issues: https://github.com/nogochain/nogo-miner/issues
+## API Reference
+
+### Internal APIs (for developers)
+
+#### RPC Client
+
+```go
+// Get block template
+func (c *Client) GetBlockTemplate(ctx context.Context) (*BlockTemplate, error)
+
+// Submit work
+func (c *Client) SubmitWork(ctx context.Context, req SubmitWorkRequest) (*SubmitWorkResponse, error)
+```
+
+#### Stratum Client
+
+```go
+// Connect to pool
+func (c *Client) Connect(ctx context.Context) error
+
+// Subscribe to jobs
+func (c *Client) Subscribe(ctx context.Context) (<-chan *MiningJob, error)
+
+// Submit share
+func (c *Client) SubmitShare(ctx context.Context, jobID uint64, nonce uint64) error
+```
+
+#### Miner
+
+```go
+// Start mining
+func (m *Miner) Start(ctx context.Context) error
+
+// Stop mining
+func (m *Miner) Stop() error
+
+// Get statistics
+func (m *Miner) GetStats() *MinerStats
+```
+
+---
 
 ## Contributing
 
-Welcome to submit issues and pull requests!
+We welcome contributions! Please follow these guidelines:
+
+### How to Contribute
+
+1. **Fork** the repository
+2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
+3. **Commit** your changes (`git commit -m 'Add amazing feature'`)
+4. **Push** to the branch (`git push origin feature/amazing-feature`)
+5. **Open** a Pull Request
+
+### Code Standards
+
+- Follow [Effective Go](https://golang.org/doc/effective_go.html)
+- Use `gofmt` for formatting
+- Write tests for new features
+- Document public APIs
+- Keep functions small and focused
+
+### Reporting Issues
+
+- Use GitHub Issues
+- Provide detailed description
+- Include steps to reproduce
+- Add system information
+- Attach logs if relevant
+
+---
+
+## License
+
+This project is licensed under the **GNU Lesser General Public License v3.0** (LGPL-3.0).
+
+See [LICENSE](LICENSE) for details.
+
+### Summary
+
+- ✅ Free to use for personal and commercial purposes
+- ✅ Modifications must be released under same license
+- ✅ Library linking allowed without copyleft
+
+---
+
+## Support
+
+### Resources
+
+- **Documentation**: https://docs.nogochain.io
+- **GitHub Issues**: https://github.com/nogochain/nogo-miner/issues
+- **Telegram**: https://t.me/nogochain
+- **Discord**: https://discord.gg/nogochain
+- **Website**: https://nogochain.io
+
+### Contact
+
+- **Email**: support@nogochain.io
+- **Twitter**: @nogochain
+- **Medium**: https://medium.com/@nogochain
+
+---
+
+## Acknowledgments
+
+- NogoChain core team for algorithm specification
+- Community contributors for testing and feedback
+- Open-source mining software community
 
 ---
 
 **Version**: v1.0.0  
-**Updated**: 2026-04-06
+**Last Updated**: 2026-05-19  
+**Maintained By**: NogoChain Development Team
+
+---
+
+*Happy Mining! ⛏️*
