@@ -4,11 +4,10 @@ package nogopow
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/big"
-	"runtime"
 	"sync"
 	"time"
-	"unsafe"
 
 	"golang.org/x/crypto/sha3"
 )
@@ -45,25 +44,17 @@ type MiningResult struct {
 
 // Engine represents the NogoPow mining engine
 type Engine struct {
-	mu          sync.RWMutex
-	running     bool
-	hashCount   uint64
-	startTime   time.Time
-	cache       *Cache
-	matA        *denseMatrix
-	matB        *denseMatrix
-	matRes      *denseMatrix
-	reuseObjects bool
+	mu        sync.RWMutex
+	running   bool
+	hashCount uint64
+	startTime time.Time
+	cache     *Cache
 }
 
 // NewEngine creates a new NogoPow engine
 func NewEngine() *Engine {
 	return &Engine{
-		cache:        NewCache(),
-		reuseObjects: true,
-		matA:         GetMatrix(matSize, matSize),
-		matB:         GetMatrix(matSize, matSize),
-		matRes:       GetMatrix(matSize, matSize),
+		cache: NewCache(),
 	}
 }
 
@@ -177,12 +168,6 @@ func (e *Engine) sealHash(header *Header) Hash {
 // computePoW computes the proof-of-work hash using NogoPow algorithm
 func (e *Engine) computePoW(blockHash, seed Hash) Hash {
 	cacheData := e.cache.GetData(seed.Bytes())
-
-	if e.reuseObjects && e.matA != nil {
-		result := mulMatrixWithPool(blockHash.Bytes(), cacheData, e.matA, e.matB, e.matRes)
-		return hashMatrix(result)
-	}
-
 	result := mulMatrix(blockHash.Bytes(), cacheData)
 	return hashMatrix(result)
 }
@@ -242,7 +227,7 @@ func (h Hash) Bytes() []byte { return h[:] }
 
 // Hex returns hex string representation
 func (h Hash) Hex() string {
-	return string(h[:])
+	return fmt.Sprintf("%x", h[:])
 }
 
 // BlockNonce represents a 32-byte nonce
@@ -325,7 +310,7 @@ func (e *Engine) Stop() {
 	e.running = false
 }
 
-// mulMatrix performs matrix multiplication (matches node implementation)
+// mulMatrix performs matrix multiplication (matches node mulMatrixPooled)
 func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
 	ui32data := make([]uint32, matNum*matSize*matSize/4)
 
@@ -337,8 +322,6 @@ func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
 		}
 	}
 
-	// Convert []uint32 to []byte for fixed-point arithmetic
-	// Security: Use binary.LittleEndian for safe type conversion instead of unsafe.Pointer
 	byteData := make([]byte, len(ui32data)*4)
 	for i, v := range ui32data {
 		binary.LittleEndian.PutUint32(byteData[i*4:i*4+4], v)
@@ -357,7 +340,6 @@ func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
 	var tmp [matSize][matSize]int64
 	var maArr [4][matSize][matSize]int64
 
-	runtime.GOMAXPROCS(4)
 	var wg sync.WaitGroup
 	wg.Add(4)
 
@@ -365,10 +347,8 @@ func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
 		go func(i int) {
 			defer wg.Done()
 
-			localMatA := GetMatrix(matSize, matSize)
-			localMatB := GetMatrix(matSize, matSize)
-			defer PutMatrix(localMatA)
-			defer PutMatrix(localMatB)
+			localMatA := newDenseMatrix(matSize, matSize, nil)
+			localMatB := newDenseMatrix(matSize, matSize, nil)
 
 			copy(localMatA.data, dataIdentity)
 
@@ -418,11 +398,6 @@ func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
 		}
 	}
 	return result
-}
-
-// mulMatrixWithPool performs matrix multiplication with object pooling
-func mulMatrixWithPool(headerHash []byte, cache []uint32, matA, matB, matRes *denseMatrix) []uint8 {
-	return mulMatrix(headerHash, cache)
 }
 
 // hashMatrix computes the final hash from matrix result
@@ -613,39 +588,50 @@ func fnv(a, b uint32) uint32 {
 	return a*0x01000193 ^ b
 }
 
-// Cache represents the cache for NogoPow
+const maxCacheItems = 64
+
+// Cache represents the LRU cache for NogoPow
 type Cache struct {
-	data map[string][]uint32
-	lock sync.RWMutex
+	data     map[string][]uint32
+	order    []string
+	lock     sync.RWMutex
 }
 
 // NewCache creates a new cache
 func NewCache() *Cache {
 	return &Cache{
-		data: make(map[string][]uint32),
+		data:  make(map[string][]uint32),
+		order: make([]string, 0, maxCacheItems),
 	}
 }
 
-// GetData gets cache data for seed
+// GetData gets cache data for seed with LRU eviction
 func (c *Cache) GetData(seed []byte) []uint32 {
+	seedStr := string(seed)
+
 	c.lock.RLock()
-	if data, ok := c.data[string(seed)]; ok {
+	if data, ok := c.data[seedStr]; ok {
 		c.lock.RUnlock()
 		return data
 	}
 	c.lock.RUnlock()
 
-	// Generate new cache data
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	// Double-check after acquiring write lock
-	if data, ok := c.data[string(seed)]; ok {
+	if data, ok := c.data[seedStr]; ok {
 		return data
 	}
 
+	if len(c.data) >= maxCacheItems {
+		oldest := c.order[0]
+		delete(c.data, oldest)
+		c.order = c.order[1:]
+	}
+
 	data := calcSeedCache(seed)
-	c.data[string(seed)] = data
+	c.data[seedStr] = data
+	c.order = append(c.order, seedStr)
 	return data
 }
 
@@ -689,13 +675,15 @@ func extendBytes(seed []byte, round int) []byte {
 // isLittleEndian checks if system is little endian
 func isLittleEndian() bool {
 	n := uint32(0x01020304)
-	return *(*byte)(unsafe.Pointer(&n)) == 0x04
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, n)
+	return buf[3] == 0x04
 }
 
-// swap swaps byte order
+// swap swaps byte order for big-endian systems
 func swap(buffer []byte) {
-	for i := 0; i < len(buffer); i += 4 {
-		binary.BigEndian.PutUint32(buffer[i:], binary.LittleEndian.Uint32(buffer[i:]))
+	for i := 0; i+4 <= len(buffer); i += 4 {
+		binary.LittleEndian.PutUint32(buffer[i:], binary.BigEndian.Uint32(buffer[i:]))
 	}
 }
 
