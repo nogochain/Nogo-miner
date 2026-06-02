@@ -1,0 +1,94 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: false
+        default: ''
+
+env:
+  GO_VERSION: '1.25'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build binaries
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}"
+
+          echo "Building for linux/amd64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o nogominer-linux-amd64 ./cmd/nogominer
+
+          echo "Building for linux/arm64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o nogominer-linux-arm64 ./cmd/nogominer
+
+          echo "Building for darwin/amd64..."
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o nogominer-darwin-amd64 ./cmd/nogominer
+
+          echo "Building for darwin/arm64..."
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o nogominer-darwin-arm64 ./cmd/nogominer
+
+          echo "Building for windows/amd64..."
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o nogominer-windows-amd64.exe ./cmd/nogominer
+
+      - name: Create checksums
+        run: |
+          sha256sum nogominer-linux-amd64 nogominer-linux-arm64 nogominer-darwin-amd64 nogominer-darwin-arm64 nogominer-windows-amd64.exe > checksums.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nogominer-binaries
+          path: |
+            nogominer-linux-amd64
+            nogominer-linux-arm64
+            nogominer-darwin-amd64
+            nogominer-darwin-arm64
+            nogominer-windows-amd64.exe
+            checksums.txt
+          retention-days: 30
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nogominer-linux-amd64
+            nogominer-linux-arm64
+            nogominer-darwin-amd64
+            nogominer-darwin-arm64
+            nogominer-windows-amd64.exe
+            checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
