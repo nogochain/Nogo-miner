@@ -4,18 +4,20 @@ package nogopow
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/crypto/sha3"
 )
 
 // Constants - EXACT copy from node
 const (
-	matSize = 256
-	matNum  = 256  // MUST match node!
+	matSize          = 256
+	matNum           = 256 // MUST match node!
 	FixedPointFactor = 1 << 30
 	FixedPointHalf   = 1 << 29
 	FixedPointShift  = 30
@@ -89,7 +91,7 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 
 	// Start from a random nonce to avoid all workers submitting nonce=0
 	startNonce := uint64(time.Now().UnixNano() % 1000000)
-	
+
 	// Try nonces until we find a valid one or are stopped
 	for nonce := startNonce; nonce < MaxNonce; nonce++ {
 		select {
@@ -139,20 +141,34 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 }
 
 // computeBlockHash computes the hash using node's exact algorithm
+// CRITICAL: Must include Coinbase and Root in the header to match
+// the node/pool rlpEncode serialization. Omitting these fields causes
+// sealHash mismatch and perpetual "invalid_pow" rejection.
 func (e *Engine) computeBlockHash(header *BlockHeader, nonce uint64) []byte {
-	// Create header with nonce for hashing
+	// Decode miner address from NOGO-format hex string to 20-byte Address
+	// The pool uses stringToAddress which strips "NOGO" prefix, hex-decodes,
+	// and takes the first 20 bytes. Must produce identical bytes.
+	coinbase := decodeMinerAddress(header.MinerAddress)
+
+	// Convert merkleRoot bytes to 32-byte Hash
+	// The pool uses copy(merkleRootHash[:], merkleRootBytes)
+	root := BytesToHash(header.MerkleRoot)
+
+	// Create header with ALL fields matching the pool/node rlpEncode order
 	blockHeader := &Header{
 		ParentHash: BytesToHash(header.PrevHash),
+		Coinbase:   coinbase,
+		Root:       root,
 		Number:     new(big.Int).SetUint64(header.Height),
 		Time:       uint64(header.Timestamp),
 		Nonce:      uint64ToBlockNonce(nonce),
 		Difficulty: header.Difficulty,
 	}
 
-	// Compute seal hash (RLP + SHA3-256) - same as node
+	// Compute seal hash (RLP + Keccak-256) - must match node/pool
 	blockHash := e.sealHash(blockHeader)
 
-	// Compute PoW using cache - same as node
+	// Compute PoW using cache - must match node/pool
 	powHash := e.computePoW(blockHash, seedFromParent(header.PrevHash))
 
 	return powHash[:]
@@ -197,6 +213,37 @@ func calcSeed(prevHash []byte) Hash {
 // seedFromParent converts parent hash to seed
 func seedFromParent(prevHash []byte) Hash {
 	return BytesToHash(prevHash)
+}
+
+// decodeMinerAddress decodes a miner address from NOGO-format hex string to 20-byte Address.
+// The miner receives the address as raw ASCII bytes from the Stratum job (e.g., "NOGO00ec...").
+// This function strips the "NOGO" prefix, hex-decodes, and extracts the first 20 bytes,
+// matching the pool's stringToAddress implementation exactly.
+func decodeMinerAddress(addrBytes []byte) Address {
+	var result Address
+
+	if len(addrBytes) == 0 {
+		return result
+	}
+
+	addrStr := string(addrBytes)
+
+	// Strip "NOGO" prefix if present (matches pool stringToAddress)
+	if len(addrStr) >= 4 && addrStr[:4] == "NOGO" {
+		addrStr = addrStr[4:]
+	}
+
+	// Hex-decode the remaining string
+	decoded, err := hex.DecodeString(addrStr)
+	if err != nil || len(decoded) < 20 {
+		// Return zero address on decode failure — the resulting sealHash
+		// will not match pool verification, which is the correct behavior
+		// for invalid miner addresses
+		return result
+	}
+
+	copy(result[:], decoded[:20])
+	return result
 }
 
 // Header represents a block header (matches node structure)
@@ -592,9 +639,9 @@ const maxCacheItems = 64
 
 // Cache represents the LRU cache for NogoPow
 type Cache struct {
-	data     map[string][]uint32
-	order    []string
-	lock     sync.RWMutex
+	data  map[string][]uint32
+	order []string
+	lock  sync.RWMutex
 }
 
 // NewCache creates a new cache
@@ -672,12 +719,13 @@ func extendBytes(seed []byte, round int) []byte {
 	return extSeed
 }
 
-// isLittleEndian checks if system is little endian
+// isLittleEndian detects the system's byte order.
+// Uses unsafe pointer to read the raw memory representation of a uint32.
+// On little-endian: 0x01020304 stored as [0x04, 0x03, 0x02, 0x01], first byte == 0x04
+// On big-endian:    0x01020304 stored as [0x01, 0x02, 0x03, 0x04], first byte == 0x01
 func isLittleEndian() bool {
 	n := uint32(0x01020304)
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, n)
-	return buf[3] == 0x04
+	return *(*byte)(unsafe.Pointer(&n)) == 0x04
 }
 
 // swap swaps byte order for big-endian systems
