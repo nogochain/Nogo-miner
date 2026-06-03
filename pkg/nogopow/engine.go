@@ -18,9 +18,9 @@ import (
 const (
 	matSize          = 256
 	matNum           = 256 // MUST match node!
-	FixedPointFactor = 1 << 30
-	FixedPointHalf   = 1 << 29
-	FixedPointShift  = 30
+	FixedPointFactor = 1 << 24
+	FixedPointHalf   = 1 << 23
+	FixedPointShift  = 24
 	MaxNonce         = 1000000000
 )
 
