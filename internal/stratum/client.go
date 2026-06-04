@@ -279,26 +279,72 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 		c.handleJob(msg)
 		
 	case "shareAccepted":
-		c.resultCh <- &SubmitResult{
-			Accepted: true,
-			JobID:    getUint64FromMap(msg, "jobId"),
-			Message:  "Share accepted",
+		// Pool sends {"method":"shareAccepted","params":{"jobId":...}}
+		// Read jobId from params, not root message
+		if params, ok := msg["params"].(map[string]interface{}); ok {
+			jobID := getUint64FromMap(params, "jobId")
+			c.resultCh <- &SubmitResult{
+				Accepted: true,
+				JobID:    jobID,
+				Message:  "Share accepted",
+			}
+			c.log.Infof("Share accepted! jobId=%d", jobID)
+		} else {
+			c.resultCh <- &SubmitResult{
+				Accepted: true,
+				JobID:    0,
+				Message:  "Share accepted",
+			}
+			c.log.Infof("Share accepted!")
 		}
-		c.log.Infof("Share accepted!")
 		
 	case "shareRejected":
+		if params, ok := msg["params"].(map[string]interface{}); ok {
+			jobID := getUint64FromMap(params, "jobId")
+			c.resultCh <- &SubmitResult{
+				Accepted: false,
+				JobID:    jobID,
+				Message:  "Share rejected",
+			}
+			c.log.Warnf("Share rejected! jobId=%d", jobID)
+		} else {
+			c.resultCh <- &SubmitResult{
+				Accepted: false,
+				JobID:    0,
+				Message:  "Share rejected",
+			}
+			c.log.Warnf("Share rejected")
+		}
+		
+	case "jobExpired":
+		// Pool sends {"method":"jobExpired","params":{"jobId":...,"reason":"..."}}
+		// Treat as a rejection — the miner should get the latest job and try again
+		var jobID uint64
+		var reason string
+		if params, ok := msg["params"].(map[string]interface{}); ok {
+			jobID = getUint64FromMap(params, "jobId")
+			if r, ok := params["reason"].(string); ok {
+				reason = r
+			}
+		}
+		c.log.Warnf("Job expired: jobId=%d, reason=%s", jobID, reason)
 		c.resultCh <- &SubmitResult{
 			Accepted: false,
-			JobID:    getUint64FromMap(msg, "jobId"),
-			Message:  "Share rejected",
+			JobID:    jobID,
+			Message:  "Job expired: " + reason,
 		}
-		c.log.Warnf("Share rejected")
 		
 	case "error":
 		if params, ok := msg["params"].(map[string]interface{}); ok {
 			if errMsg, ok := params["message"].(string); ok {
 				c.log.Errorf("Pool error: %s", errMsg)
-				// Send login failure to channel if still waiting
+				// Send rejection to result channel so miner can react
+				c.resultCh <- &SubmitResult{
+					Accepted: false,
+					JobID:    getUint64FromMap(params, "jobId"),
+					Message:  errMsg,
+				}
+				// Also handle login failure if still waiting
 				select {
 				case c.loginRespCh <- false:
 				default:

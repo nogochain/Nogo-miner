@@ -140,7 +140,11 @@ func (m *Miner) runWorker(worker *Worker) {
 			m.log.Debugf("Worker %d stopped", worker.id)
 			return
 		default:
-			// Get current job
+			// Get current job - capture the specific job this worker will mine on.
+			// CRITICAL: The worker must pass this exact job reference through to
+			// submitSolution so the share is submitted with the correct jobId.
+			// Reading m.currentJob again at submission time is a race condition
+			// because a new job may have arrived while the worker was mining.
 			m.jobMu.RLock()
 			job := m.currentJob
 			m.jobMu.RUnlock()
@@ -151,11 +155,11 @@ func (m *Miner) runWorker(worker *Worker) {
 				continue
 			}
 
-			// Mine with this job
+			// Mine with this specific job
 			result := worker.mine(job)
 
 			if result != nil && result.Success {
-				m.handleSuccess(worker, result)
+				m.handleSuccess(worker, result, job)
 			}
 		}
 	}
@@ -215,12 +219,14 @@ func (w *Worker) logHashRate(hashRate float64, duration time.Duration, hashes ui
 }
 
 // handleSuccess handles a successful mining result
-func (m *Miner) handleSuccess(worker *Worker, result *nogopow.MiningResult) {
-	m.log.Infof("Worker %d found solution! Nonce: %d, Hashes: %d",
-		worker.id, result.Nonce, result.HashesTried)
+func (m *Miner) handleSuccess(worker *Worker, result *nogopow.MiningResult, job *MiningJob) {
+	m.log.Infof("Worker %d found solution! Nonce: %d, Hashes: %d, JobID: %d",
+		worker.id, result.Nonce, result.HashesTried, job.JobIDNum)
 
-	// Submit to pool and wait for result
-	m.submitSolution(result)
+	// Submit to pool using the specific job the nonce was computed against.
+	// CRITICAL: Use the captured job reference, NOT m.currentJob, to avoid
+	// submitting with a different jobId than what the nonce was mined for.
+	m.submitSolution(result, job)
 
 	// Listen for submission result
 	go m.listenForResult()
@@ -260,20 +266,20 @@ func (m *Miner) listenForResult() {
 	}
 }
 
-// submitSolution submits a solution to the pool
-func (m *Miner) submitSolution(result *nogopow.MiningResult) {
+// submitSolution submits a solution to the pool using the specific job the nonce was mined for.
+// CRITICAL: The `job` parameter must be the exact job reference that was passed to worker.mine(),
+// NOT m.currentJob, because m.currentJob may have been updated to a different job while the
+// worker was mining. Using the wrong jobId for submission causes the pool to validate the
+// share against different parameters, resulting in "invalid PoW" rejection.
+func (m *Miner) submitSolution(result *nogopow.MiningResult, job *MiningJob) {
 	client := m.poolManager.GetClient()
 	if client == nil {
 		m.log.Error("No pool client available")
 		return
 	}
 
-	m.jobMu.RLock()
-	job := m.currentJob
-	m.jobMu.RUnlock()
-
 	if job == nil {
-		m.log.Warn("No current job to submit solution")
+		m.log.Warn("No job to submit solution")
 		return
 	}
 

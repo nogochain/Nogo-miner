@@ -115,6 +115,16 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 		hashBig := new(big.Int).SetBytes(blockHash)
 		if hashBig.Cmp(target) <= 0 {
 			// Found valid hash!
+			// Log comprehensive debug info for cross-referencing with pool
+			fmt.Printf("[NogoPow] ✅ Solution found: nonce=%d, hashes=%d, duration=%v\n",
+				nonce, localHashCount, time.Since(startTime))
+			fmt.Printf("[NogoPow]   Header: height=%d, prevHash=%x, merkleRoot=%x, timestamp=%d, difficulty=%s, minerAddr=%x\n",
+				header.Height, header.PrevHash[:min(8, len(header.PrevHash))],
+				header.MerkleRoot[:min(8, len(header.MerkleRoot))],
+				header.Timestamp, header.Difficulty.String(),
+				header.MinerAddress[:min(8, len(header.MinerAddress))])
+			fmt.Printf("[NogoPow]   Result: hash=%x, target=%s\n", blockHash, target.String())
+
 			return &MiningResult{
 				Nonce:       nonce,
 				BlockHash:   blockHash,
