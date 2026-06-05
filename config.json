@@ -11,7 +11,7 @@
       "name": "NogoPool",
       "url": "http://localhost:1818",
       "ws_url": "ws://localhost:1819/stratum",
-      "address": "NOGO00d20c827391ea4e9df242418a33ba4c47bcfe92bf1aa2a8d09df72b72623b7f52cb2200e6",
+      "address": "Your wallet address",
       "priority": 1,
       "enabled": true
     }
