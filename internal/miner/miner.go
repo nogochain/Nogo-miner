@@ -297,26 +297,59 @@ func (m *Miner) submitSolution(result *nogopow.MiningResult, job *MiningJob) {
 	m.log.Infof("Share submitted: jobId=%d, nonce=%d", job.JobIDNum, result.Nonce)
 }
 
-// monitorJobs monitors and fetches new mining jobs from Stratum client
+// monitorJobs monitors and fetches new mining jobs from Stratum client.
+// Handles reconnection: if job channel closes (client stopped during pool switch),
+// it re-fetches the current client and retries.
 func (m *Miner) monitorJobs() {
-	client := m.poolManager.GetClient()
-	if client == nil {
-		m.log.Debug("No pool client available for job fetch")
-		return
-	}
+	// Re-fetch ticker for dynamic client discovery
+	refetchTicker := time.NewTicker(15 * time.Second)
+	defer refetchTicker.Stop()
 
-	jobCh := client.GetJobChannel()
+	// Job expiry: discard jobs older than 10 minutes to prevent stale mining
+	const jobExpiryDuration = 10 * time.Minute
 
 	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case job, ok := <-jobCh:
-			if !ok {
-				m.log.Warn("Job channel closed")
+		client := m.poolManager.GetClient()
+		if client == nil {
+			m.log.Debug("No pool client available for job fetch, retrying in 15s")
+			select {
+			case <-m.ctx.Done():
 				return
+			case <-refetchTicker.C:
+				continue
 			}
-			m.handleNewJob(job)
+		}
+
+		jobCh := client.GetJobChannel()
+
+		m.log.Debugf("monitorJobs: listening on job channel")
+
+	innerLoop:
+		for {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-refetchTicker.C:
+				// Periodically check if the client has changed (pool switch)
+				currentClient := m.poolManager.GetClient()
+				if currentClient != client {
+					m.log.Debugf("monitorJobs: pool client changed, re-fetching job channel")
+					break innerLoop
+				}
+			case job, ok := <-jobCh:
+				if !ok {
+					m.log.Warn("Job channel closed, re-fetching client")
+					break innerLoop
+				}
+
+				// Discard stale jobs beyond expiry threshold
+				if time.Since(time.Unix(job.Timestamp, 0)) > jobExpiryDuration {
+					m.log.Debugf("Skipping expired job: height=%d, timestamp=%d", job.Height, job.Timestamp)
+					continue
+				}
+
+				m.handleNewJob(job)
+			}
 		}
 	}
 }

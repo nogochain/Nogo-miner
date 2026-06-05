@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"net/url"
@@ -15,19 +16,36 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Reconnection backoff parameters
+const (
+	initialReconnectDelay = 1 * time.Second
+	maxReconnectDelay     = 30 * time.Second
+	readDeadlineDuration  = 90 * time.Second // Read deadline for silent disconnection detection
+)
+
 // Client represents a Stratum client for pool communication
 type Client struct {
-	mu           sync.RWMutex
-	conn         *websocket.Conn
-	poolURL      string
-	minerAddr    string
-	log          Logger
-	connected    bool
-	jobCh        chan *MiningJob
-	resultCh     chan *SubmitResult
-	lastJob      *MiningJob
-	subscribeID  string
-	loginRespCh  chan bool  // Channel to wait for login response
+	mu          sync.RWMutex
+	sendMu      sync.Mutex // Protects WebSocket write operations (gorilla/websocket forbids concurrent write)
+	conn        *websocket.Conn
+	poolURL     string
+	minerAddr   string
+	log         Logger
+	connected   bool
+	jobCh       chan *MiningJob
+	resultCh    chan *SubmitResult
+	lastJob     *MiningJob
+	subscribeID string
+	loginRespCh chan bool // Channel to wait for login response
+
+	// readLoopOnce ensures the read loop goroutine is started exactly once.
+	// After initial Connect, the read loop handles all reconnection internally.
+	readLoopStarted bool
+
+	// stopCh is closed when Close() is called to permanently stop the read loop.
+	// This prevents the read loop from reconnecting when the pool is deliberately
+	// switched away (pool manager switchToNextPool).
+	stopCh chan struct{}
 }
 
 // MiningJob represents a mining job from pool
@@ -78,97 +96,193 @@ func NewClient(poolURL, minerAddr string, log Logger) *Client {
 		jobCh:       make(chan *MiningJob, 10),
 		resultCh:    make(chan *SubmitResult, 10),
 		loginRespCh: make(chan bool, 1),
+		stopCh:      make(chan struct{}),
 	}
 }
 
-// Connect establishes WebSocket connection to pool
+// Connect establishes WebSocket connection to pool.
+// On the first call, it also starts the persistent read loop that handles
+// auto-reconnection when the connection drops. Subsequent calls are no-ops
+// if the read loop is already running.
 func (c *Client) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	if c.readLoopStarted {
+		// Read loop already running and handles reconnection internally.
+		// If currently disconnected, the read loop will reconnect automatically.
+		c.mu.Unlock()
+		c.log.Debugf("Connect called but read loop already running, skipping")
+		return nil
+	}
+	c.readLoopStarted = true
+	c.mu.Unlock()
+
 	c.log.Infof("Connecting to pool: %s", c.poolURL)
 
+	// Initial connection — dialAndLogin reads WebSocket directly until loginSuccess,
+	// because readLoop hasn't started yet.
+	log.Printf("[NOGOMINER] Attempting connection to pool: %s", c.poolURL)
+	if err := c.dialAndLogin(ctx); err != nil {
+		c.log.Errorf("Initial connection failed: %v", err)
+		log.Printf("[NOGOMINER] ❌ Connection FAILED: %v", err)
+		return err
+	}
+
+	log.Printf("[NOGOMINER] ✅ Connection and login SUCCESSFUL!")
+
+	// Start the persistent read loop that handles auto-reconnection.
+	// This single goroutine lives for the entire client lifetime.
+	// IMPORTANT: Use context.Background() instead of the caller's ctx,
+	// because the ctx passed to Connect() is typically a timeout context
+	// created by connectToPool (e.g. 10s), which gets cancelled immediately
+	// after Connect returns. readLoop must survive for the entire client lifetime.
+	go c.readLoop(context.Background())
+
+	return nil
+}
+
+// dialAndLogin dials WebSocket and performs login (used for both initial connect and reconnection).
+// CRITICAL: This function reads WebSocket messages directly until loginSuccess is received,
+// because the readLoop hasn't started yet (initial connect) or is blocked waiting for this
+// function to return (reconnection). Without direct reading, no one processes the WebSocket
+// response and login would always time out.
+func (c *Client) dialAndLogin(ctx context.Context) error {
 	// Parse poolURL to get host
 	parsedURL, err := url.Parse(c.poolURL)
 	if err != nil {
-		c.log.Errorf("Failed to parse pool URL: %v", err)
 		return fmt.Errorf("parse pool URL: %w", err)
 	}
-	
-	// Extract host:port from URL (strip protocol and path)
+
 	poolHost := parsedURL.Host
 	if poolHost == "" {
-		// Fallback for URLs without explicit host
 		poolHost = strings.TrimPrefix(parsedURL.Path, "//")
 		if idx := strings.Index(poolHost, "/"); idx != -1 {
 			poolHost = poolHost[:idx]
 		}
 	}
-	
-	c.log.Infof("Parsed pool URL: %s -> host: %s", c.poolURL, poolHost)
 
-	// First test TCP connectivity
-	c.log.Infof("Testing TCP connectivity to %s...", poolHost)
+	// Test TCP connectivity first
 	tcpConn, err := net.DialTimeout("tcp", poolHost, 5*time.Second)
 	if err != nil {
-		c.log.Errorf("TCP connection failed: %v", err)
 		return fmt.Errorf("tcp connect: %w", err)
 	}
 	tcpConn.Close()
-	c.log.Infof("TCP connection successful")
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		Proxy:            nil, // Don't use proxy
+		Proxy:            nil,
 	}
 
 	conn, _, err := dialer.Dial(c.poolURL, nil)
 	if err != nil {
-		c.log.Errorf("WebSocket dial failed: %v", err)
 		return fmt.Errorf("dial pool: %w", err)
 	}
 
+	// Replace old connection
 	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+	}
 	c.conn = conn
-	c.connected = true
+	c.connected = false // Not confirmed until loginSuccess
 	c.mu.Unlock()
-	
-	c.log.Infof("Connected to pool")
 
-	// Start message reader FIRST before sending login
-	c.log.Infof("Starting readMessages goroutine...")
-	go c.readMessages(ctx)
-
-	// Wait a bit for welcome message
-	time.Sleep(100 * time.Millisecond)
-	c.log.Infof("Sending login request...")
+	// Drain login response channel to remove stale values
+	select {
+	case <-c.loginRespCh:
+	default:
+	}
 
 	// Login to pool
 	if err := c.login(ctx); err != nil {
-		c.log.Errorf("Login failed: %v", err)
-		conn.Close()
 		c.mu.Lock()
 		c.connected = false
-		c.mu.Unlock()
-		return fmt.Errorf("login: %w", err)
-	}
-
-	c.log.Infof("Waiting for login response...")
-
-	// Wait for login response (with timeout)
-	select {
-	case success := <-c.loginRespCh:
-		if !success {
-			c.log.Errorf("Login response: failed")
-			return fmt.Errorf("login failed")
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
 		}
-		c.log.Infof("Login confirmed")
-	case <-time.After(5 * time.Second):
-		c.log.Errorf("Login timeout after 5 seconds")
-		return fmt.Errorf("login timeout")
-	case <-ctx.Done():
-		c.log.Errorf("Context cancelled: %v", ctx.Err())
-		return ctx.Err()
+		c.mu.Unlock()
+		return fmt.Errorf("send login: %w", err)
 	}
 
-	return nil
+	// CRITICAL: Read WebSocket messages directly until loginSuccess is confirmed.
+	// The readLoop is not running (initial connect) or blocked (reconnection),
+	// so we must process messages here to avoid login timeout.
+	// Welcome and other informational messages are processed inline;
+	// subsequent messages are handled by the persistent readLoop after return.
+	c.log.Debugf("dialAndLogin: waiting for login response (reading WebSocket directly)...")
+	loginDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(loginDeadline) {
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			c.log.Debugf("dialAndLogin: setReadDeadline error: %v", err)
+		}
+
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // Timeout but still within login deadline
+			}
+			// Connection error — fail login
+			c.mu.Lock()
+			c.connected = false
+			if c.conn != nil {
+				c.conn.Close()
+				c.conn = nil
+			}
+			c.mu.Unlock()
+			return fmt.Errorf("read login response: %w", err)
+		}
+
+		// Process the message
+		var msg map[string]interface{}
+		if err := json.Unmarshal(message, &msg); err != nil {
+			c.log.Debugf("dialAndLogin: unmarshal error: %v", err)
+			continue
+		}
+
+		method, _ := msg["method"].(string)
+		switch method {
+		case "loginSuccess":
+			c.mu.Lock()
+			c.connected = true
+			c.mu.Unlock()
+			// Notify login response channel (for any concurrent waiters)
+			select {
+			case c.loginRespCh <- true:
+			default:
+			}
+			c.log.Infof("Login confirmed (direct read)")
+			return nil
+
+		case "welcome":
+			c.log.Infof("Received welcome from pool (direct read)")
+
+		case "error":
+			if params, ok := msg["params"].(map[string]interface{}); ok {
+				if errMsg, ok := params["message"].(string); ok {
+					c.log.Errorf("Pool login error: %s", errMsg)
+				}
+			}
+			// Login failed
+			c.mu.Lock()
+			c.connected = false
+			if c.conn != nil {
+				c.conn.Close()
+				c.conn = nil
+			}
+			c.mu.Unlock()
+			return fmt.Errorf("login rejected by pool")
+		}
+	}
+
+	// Login deadline expired
+	c.mu.Lock()
+	c.connected = false
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+	c.mu.Unlock()
+	return fmt.Errorf("login timeout: no login response within 10s")
 }
 
 // login sends login request to pool
@@ -181,7 +295,7 @@ func (c *Client) login(ctx context.Context) error {
 	}
 
 	c.log.Debugf("Sending login request with address: %s", c.minerAddr)
-	
+
 	if err := c.sendRequest(ctx, req); err != nil {
 		c.log.Errorf("Failed to send login request: %v", err)
 		return err
@@ -194,7 +308,7 @@ func (c *Client) login(ctx context.Context) error {
 // sendRequest sends a JSON-RPC request
 func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) error {
 	c.log.Infof(">>> sendRequest called")
-	
+
 	data, err := json.Marshal(req)
 	if err != nil {
 		c.log.Errorf("Marshal error: %v", err)
@@ -211,35 +325,96 @@ func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) er
 	}
 
 	c.log.Debugf("Sending message: %s", string(data))
-	
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+
+	// Use sendMu to prevent concurrent write to WebSocket (gorilla/websocket forbids concurrent write)
+	c.sendMu.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, data)
+	c.sendMu.Unlock()
+
+	if err != nil {
 		c.log.Errorf("WriteMessage error: %v", err)
 		return err
 	}
-	
+
 	c.log.Infof(">>> Message sent successfully")
-	
+
 	return nil
 }
 
-// readMessages reads incoming messages from pool
-func (c *Client) readMessages(ctx context.Context) {
-	c.log.Debugf("readMessages started")
+// readLoop is the persistent read loop with auto-reconnection.
+// It runs in a single goroutine for the entire client lifetime.
+// When the WebSocket connection drops, it automatically reconnects
+// with exponential backoff and resumes reading messages.
+// When Close() is called (e.g., pool switch), stopCh is closed and
+// the loop exits permanently.
+func (c *Client) readLoop(ctx context.Context) {
+	c.log.Debugf("readLoop started (persistent, with auto-reconnection)")
+
+	backoff := initialReconnectDelay
+
 	for {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			c.log.Debugf("readLoop: context cancelled, exiting")
+			return
+		case <-c.stopCh:
+			c.log.Debugf("readLoop: stopCh closed, exiting")
+			return
+		default:
+		}
+
 		c.mu.RLock()
 		conn := c.conn
 		c.mu.RUnlock()
 
 		if conn == nil {
-			c.log.Debugf("readMessages: conn is nil, exiting")
-			return
+			// Connection is nil - attempt reconnection with backoff
+			// But check stopCh and ctx during the wait
+			c.log.Debugf("readLoop: conn is nil, reconnecting in %v...", backoff)
+
+			select {
+			case <-ctx.Done():
+				c.log.Debugf("readLoop: context cancelled during backoff")
+				return
+			case <-c.stopCh:
+				c.log.Debugf("readLoop: stopCh closed during backoff")
+				return
+			case <-time.After(backoff):
+			}
+
+			if err := c.dialAndLogin(ctx); err != nil {
+				c.log.Errorf("readLoop: reconnection failed: %v", err)
+				backoff *= 2
+				if backoff > maxReconnectDelay {
+					backoff = maxReconnectDelay
+				}
+				continue
+			}
+
+			c.log.Infof("readLoop: reconnected successfully")
+			backoff = initialReconnectDelay // Reset backoff on success
+			continue
+		}
+
+		// Set read deadline to detect silent disconnections
+		// (e.g., network partition, pool crash without TCP RST)
+		if err := conn.SetReadDeadline(time.Now().Add(readDeadlineDuration)); err != nil {
+			c.log.Debugf("readLoop: setReadDeadline error: %v", err)
 		}
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			c.log.Errorf("Read error: %v", err)
+			c.log.Errorf("readLoop: read error: %v", err)
+			c.mu.Lock()
 			c.connected = false
-			return
+			if c.conn != nil {
+				c.conn.Close()
+				c.conn = nil
+			}
+			c.mu.Unlock()
+			// Loop back - will reconnect on next iteration with backoff
+			continue
 		}
 
 		c.log.Debugf("Received message: %s", string(message))
@@ -263,7 +438,7 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 	switch method {
 	case "welcome":
 		c.log.Infof("Received welcome from pool")
-		
+
 	case "loginSuccess":
 		c.log.Infof("Login successful")
 		// Send login success to channel
@@ -271,13 +446,13 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 		case c.loginRespCh <- true:
 		default:
 		}
-		
+
 	case "newJob":
 		c.handleNewJob(msg)
-		
+
 	case "job":
 		c.handleJob(msg)
-		
+
 	case "shareAccepted":
 		// Pool sends {"method":"shareAccepted","params":{"jobId":...}}
 		// Read jobId from params, not root message
@@ -297,7 +472,7 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 			}
 			c.log.Infof("Share accepted!")
 		}
-		
+
 	case "shareRejected":
 		if params, ok := msg["params"].(map[string]interface{}); ok {
 			jobID := getUint64FromMap(params, "jobId")
@@ -315,7 +490,7 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 			}
 			c.log.Warnf("Share rejected")
 		}
-		
+
 	case "jobExpired":
 		// Pool sends {"method":"jobExpired","params":{"jobId":...,"reason":"..."}}
 		// Treat as a rejection — the miner should get the latest job and try again
@@ -333,7 +508,7 @@ func (c *Client) handleMessage(ctx context.Context, data []byte) {
 			JobID:    jobID,
 			Message:  "Job expired: " + reason,
 		}
-		
+
 	case "error":
 		if params, ok := msg["params"].(map[string]interface{}); ok {
 			if errMsg, ok := params["message"].(string); ok {
@@ -427,10 +602,19 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
-// Close closes the connection
+// Close closes the connection and permanently stops the read loop.
+// After Close, the client cannot be reused - a new Client must be created.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Close stopCh to signal readLoop to exit permanently
+	select {
+	case <-c.stopCh:
+		// Already closed
+	default:
+		close(c.stopCh)
+	}
 
 	if c.conn != nil {
 		if err := c.conn.Close(); err != nil {
