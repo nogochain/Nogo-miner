@@ -317,11 +317,10 @@ func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) er
 
 	c.mu.RLock()
 	conn := c.conn
-	connected := c.connected
 	c.mu.RUnlock()
 
-	if conn == nil || !connected {
-		c.log.Errorf("Connection is not established (conn=%v, connected=%v)", conn != nil, connected)
+	if conn == nil {
+		c.log.Errorf("Connection is nil (sendRequest blocked)")
 		return fmt.Errorf("not connected")
 	}
 
