@@ -317,10 +317,11 @@ func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) er
 
 	c.mu.RLock()
 	conn := c.conn
+	connected := c.connected
 	c.mu.RUnlock()
 
-	if conn == nil {
-		c.log.Errorf("Connection is nil")
+	if conn == nil || !connected {
+		c.log.Errorf("Connection is not established (conn=%v, connected=%v)", conn != nil, connected)
 		return fmt.Errorf("not connected")
 	}
 
@@ -603,12 +604,14 @@ func (c *Client) IsConnected() bool {
 }
 
 // Close closes the connection and permanently stops the read loop.
-// After Close, the client cannot be reused - a new Client must be created.
+// After Close, the client can be reused by calling Connect() again.
+// readLoopStarted and stopCh are reset so that a subsequent Connect() call
+// can start a fresh read loop (needed for pool switching).
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Close stopCh to signal readLoop to exit permanently
+	// Close stopCh to signal readLoop to exit
 	select {
 	case <-c.stopCh:
 		// Already closed
@@ -616,13 +619,21 @@ func (c *Client) Close() error {
 		close(c.stopCh)
 	}
 
+	// Close the current WebSocket connection
 	if c.conn != nil {
 		if err := c.conn.Close(); err != nil {
-			return err
+			c.log.Debugf("Close: connection close error: %v", err)
 		}
 		c.conn = nil
 	}
 	c.connected = false
+
+	// Reset internal state so this Client can be reused by a subsequent Connect() call.
+	// Without this, Connect() would see readLoopStarted=true and return nil immediately,
+	// preventing reconnection after pool switch.
+	c.readLoopStarted = false
+	c.stopCh = make(chan struct{})
+
 	return nil
 }
 
