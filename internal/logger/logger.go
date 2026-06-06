@@ -260,18 +260,24 @@ func (l *Logger) log(level Level, msg string, fields map[string]interface{}) {
 		}
 		fmt.Fprintln(l.writer, string(data))
 	} else {
-		// Text format with ANSI colors
-		color := getColor(level)
-		reset := "\033[0m"
+		// Detect if writing to terminal or file
+		toTerminal := l.writer == os.Stdout || l.writer == os.Stderr
 		timestamp := entry.Timestamp[11:19] // HH:MM:SS
 		
+		var color, reset string
+		if toTerminal {
+			color = getColor(level)
+			reset = "\033[0m"
+		}
+		
 		var output string
-		if entry.Caller != "" {
-			output = fmt.Sprintf("%s%s %s%-5s%s [%s] %s", 
+		// Only show caller info on terminal, omit in log file (noise)
+		if entry.Caller != "" && toTerminal {
+			output = fmt.Sprintf("%s%s %s%-5s%s [%s] %s",
 				timestamp, color, color, entry.Level, reset, entry.Caller, entry.Message)
 		} else {
-			output = fmt.Sprintf("%s%s %s%-5s%s %s", 
-				timestamp, color, color, entry.Level, reset, entry.Message)
+			output = fmt.Sprintf("%s%s %-5s%s %s",
+				timestamp, color, entry.Level, reset, entry.Message)
 		}
 		
 		if len(fields) > 0 {

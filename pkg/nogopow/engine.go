@@ -70,6 +70,7 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 	}
 	e.running = true
 	e.startTime = time.Now()
+	e.hashCount = 0 // Reset per-session hash counter for accurate hashrate
 	e.mu.Unlock()
 
 	defer func() {
@@ -115,16 +116,7 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 		// Check if hash meets target
 		hashBig := new(big.Int).SetBytes(blockHash)
 		if hashBig.Cmp(target) <= 0 {
-			// Found valid hash!
-			// Log comprehensive debug info for cross-referencing with pool
-			fmt.Printf("[NogoPow] ✅ Solution found: nonce=%d, hashes=%d, duration=%v\n",
-				nonce, localHashCount, time.Since(startTime))
-			fmt.Printf("[NogoPow]   Header: height=%d, prevHash=%x, merkleRoot=%x, timestamp=%d, difficulty=%s, minerAddr=%x\n",
-				header.Height, header.PrevHash[:min(8, len(header.PrevHash))],
-				header.MerkleRoot[:min(8, len(header.MerkleRoot))],
-				header.Timestamp, header.Difficulty.String(),
-				header.MinerAddress[:min(8, len(header.MinerAddress))])
-			fmt.Printf("[NogoPow]   Result: hash=%x, target=%s\n", blockHash, target.String())
+			// Found valid hash! Moved to miner-level logging to avoid TUI corruption.
 
 			return &MiningResult{
 				Nonce:       nonce,

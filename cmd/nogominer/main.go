@@ -154,19 +154,18 @@ running:
 	log.Infof("📊 Final stats: %s", mon.GetSummary())
 }
 
-// displayStats displays mining statistics
+// displayStats displays mining statistics (called every 5s)
 func displayStats(stats *monitor.Stats, m *miner.Miner) {
 	minerStats := m.GetStats()
 	
-	fmt.Printf("\n")
 	fmt.Printf("╔══════════════════════════════════════════════════════════╗\n")
 	fmt.Printf("║  %-10s v%-5s                              ║\n", appName, version)
 	fmt.Printf("╠══════════════════════════════════════════════════════════╣\n")
 	fmt.Printf("║  Status: %-8s                                      ║\n", getStatus(minerStats.Running))
 	fmt.Printf("║  Uptime: %-10s                                     ║\n", formatUptime(stats.Uptime))
 	fmt.Printf("╠══════════════════════════════════════════════════════════╣\n")
-	fmt.Printf("║  Hashrate: %-12s  Avg: %-12s          ║\n", 
-		formatHashRate(stats.HashRate), formatHashRate(stats.AvgHashRate))
+	fmt.Printf("║  Hashrate: %-12s (Hashes: %d)               ║\n", 
+		formatHashRate(stats.AvgHashRate), stats.TotalHashes)
 	fmt.Printf("║  Workers: %-4d                                           ║\n", minerStats.ActiveWorkers)
 	fmt.Printf("╠══════════════════════════════════════════════════════════╣\n")
 	fmt.Printf("║  Shares: %-4d Accepted / %-4d Rejected / %-4d Invalid   ║\n",
@@ -177,7 +176,6 @@ func displayStats(stats *monitor.Stats, m *miner.Miner) {
 	fmt.Printf("║  Reward: %.6f NOGO (Est: %.6f NOGO)                  ║\n",
 		stats.TotalReward, stats.EstimatedReward)
 	fmt.Printf("╚══════════════════════════════════════════════════════════╝\n")
-	fmt.Printf("\033[A\033[A\033[A\033[A\033[A\033[A\033[A\033[A\033[A\033[A\033[A\033[A") // Move cursor up
 }
 
 func getStatus(running bool) string {

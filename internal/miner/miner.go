@@ -170,8 +170,6 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 	atomic.StoreInt32(&w.isMining, 1)
 	defer atomic.StoreInt32(&w.isMining, 0)
 
-	startTime := time.Now()
-
 	// Create stop channel for this mining session
 	mineStopCh := make(chan struct{})
 
@@ -201,13 +199,6 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 
 	// Update hash count
 	atomic.AddUint64(&w.hashCount, result.HashesTried)
-
-	// Log hash rate for this mining session
-	duration := time.Since(startTime)
-	if duration > 0 && result.HashesTried > 0 {
-		hashRate := float64(result.HashesTried) / duration.Seconds()
-		w.logHashRate(hashRate, duration, result.HashesTried)
-	}
 
 	return result
 }

@@ -321,7 +321,7 @@ func (c *Client) login(ctx context.Context) error {
 		},
 	}
 
-	c.log.Debugf("Sending login request with address: %s", c.minerAddr)
+	c.log.Debugf("Sending login (addr: %s...)", c.minerAddr[:min(16, len(c.minerAddr))])
 
 	if err := c.sendRequest(ctx, req); err != nil {
 		c.log.Errorf("Failed to send login request: %v", err)
@@ -351,10 +351,17 @@ func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) er
 		return fmt.Errorf("not connected")
 	}
 
-	c.log.Debugf("Sending message: %s", string(data))
+	if len(data) > 120 {
+		c.log.Debugf("Send: %s...", string(data[:120]))
+	} else {
+		c.log.Debugf("Send: %s", string(data))
+	}
 
 	// Use sendMu to prevent concurrent write to WebSocket (gorilla/websocket forbids concurrent write)
+	// This also protects against concurrent writes from pingLoop
 	c.sendMu.Lock()
+	// Set write deadline to prevent indefinite block on broken connection
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	err = conn.WriteMessage(websocket.TextMessage, data)
 	c.sendMu.Unlock()
 
@@ -431,6 +438,11 @@ func (c *Client) readLoop(ctx context.Context) {
 			continue
 		}
 
+		// Start ping goroutine for this connection
+		pingStop := make(chan struct{})
+		go c.pingLoop(conn, pingStop)
+		defer close(pingStop) // Always stop pinger when this connection ends
+
 		// Set read deadline to detect silent disconnections
 		// (e.g., network partition, pool crash without TCP RST)
 		if err := conn.SetReadDeadline(time.Now().Add(readDeadlineDuration)); err != nil {
@@ -451,8 +463,40 @@ func (c *Client) readLoop(ctx context.Context) {
 			continue
 		}
 
-		c.log.Debugf("Received message: %s", string(message))
+		if len(message) > 120 {
+		c.log.Debugf("Recv: %s...", string(message[:120]))
+	} else {
+		c.log.Debugf("Recv: %s", string(message))
+	}
 		c.handleMessage(ctx, message)
+	}
+}
+
+// pingLoop sends periodic WebSocket ping frames to keep the connection alive.
+// NAT gateways and firewalls typically drop idle TCP connections after 60-120s.
+// Sending a ping every 25 seconds prevents this without the 90s readDeadline timeout.
+func (c *Client) pingLoop(conn *websocket.Conn, stop <-chan struct{}) {
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if conn == nil {
+				return
+			}
+			// Lock sendMu to prevent concurrent write with sendRequest
+			// gorilla/websocket forbids concurrent WriteMessage calls
+			c.sendMu.Lock()
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			err := conn.WriteMessage(websocket.PingMessage, nil)
+			c.sendMu.Unlock()
+			if err != nil {
+				return // Connection lost, stop pinging (readLoop will reconnect)
+			}
+		}
 	}
 }
 
