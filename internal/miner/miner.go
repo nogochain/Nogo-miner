@@ -182,10 +182,13 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 	defer timeout.Stop()
 
 	// Start mining with the new engine API
+	// CRITICAL: Must include StateRoot to match node's Header.Root (state root)
+	// Note: TxHash is calculated from MerkleRoot inside engine.Mine()
 	result := w.engine.Mine(&nogopow.BlockHeader{
 		Height:       job.Template.Height,
 		PrevHash:     job.Template.PrevHash,
 		MerkleRoot:   job.Template.MerkleRoot,
+		StateRoot:    job.Template.StateRoot, // State root for PoW calculation
 		Timestamp:    job.Template.Timestamp,
 		Difficulty:   job.Template.Difficulty,
 		MinerAddress: job.Template.MinerAddress,
@@ -356,8 +359,8 @@ func (m *Miner) monitorJobs() {
 
 // handleNewJob processes a new mining job from pool
 func (m *Miner) handleNewJob(job *stratum.MiningJob) {
-	m.log.Infof("Received new mining job: height=%d, jobId=%d, difficulty=%d",
-		job.Height, job.JobID, job.Difficulty)
+	m.log.Infof("Received new mining job: height=%d, jobId=%d, difficulty=%d, stateRoot=%s",
+		job.Height, job.JobID, job.Difficulty, job.StateRoot)
 
 	// Convert hex strings to byte slices
 	prevHash, err := hex.DecodeString(job.PrevHash)
@@ -372,6 +375,35 @@ func (m *Miner) handleNewJob(job *stratum.MiningJob) {
 		return
 	}
 
+	// Decode stateRoot (World State MPT root hash, REQUIRED for PoW)
+	// CRITICAL: StateRoot must NOT be empty - PoW verification will fail
+	var stateRoot []byte
+	if job.StateRoot != "" {
+		var err error
+		stateRoot, err = hex.DecodeString(job.StateRoot)
+		if err != nil {
+			m.log.Errorf("❌ CRITICAL: Failed to decode stateRoot: %v", err)
+			m.log.Errorf("❌ Cannot mine without valid stateRoot - PoW verification will fail!")
+			return // ❌ REFUSE to mine - stateRoot is invalid
+		}
+		// Validate stateRoot length (must be 32 bytes for Keccak-256 hash)
+		if len(stateRoot) != 32 {
+			m.log.Errorf("❌ CRITICAL: Invalid stateRoot length: %d bytes (expected 32)", len(stateRoot))
+			m.log.Errorf("❌ Cannot mine without valid stateRoot - PoW verification will fail!")
+			return // ❌ REFUSE to mine - stateRoot is invalid
+		}
+		m.log.Infof("✅ StateRoot decoded successfully: %x...", stateRoot[:8])
+	} else {
+		// ❌ CRITICAL: StateRoot is EMPTY - refuse to mine
+		m.log.Errorf("❌ CRITICAL: StateRoot is EMPTY! Pool must send stateRoot for correct PoW calculation.")
+		m.log.Errorf("❌ Cannot mine without stateRoot - PoW verification will fail!")
+		m.log.Errorf("❌ Possible causes:")
+		m.log.Errorf("❌   1. Pool is not sending stateRoot (bug in NogoPool)")
+		m.log.Errorf("❌   2. Node is not calculating stateRoot (bug in NogoChain)")
+		m.log.Errorf("❌   3. Network error - job data corrupted")
+		return // ❌ REFUSE to mine - stateRoot is empty
+	}
+
 	// Convert Stratum job to internal mining job
 	// Job difficulty is already *big.Int from stratum client
 	difficulty := job.Difficulty
@@ -383,6 +415,7 @@ func (m *Miner) handleNewJob(job *stratum.MiningJob) {
 		Height:       job.Height,
 		PrevHash:     prevHash,
 		MerkleRoot:   merkleRoot,
+		StateRoot:    stateRoot, // World State MPT root hash (for PoW)
 		Timestamp:    job.Timestamp,
 		Difficulty:   difficulty,
 		MinerAddress: minerAddr,

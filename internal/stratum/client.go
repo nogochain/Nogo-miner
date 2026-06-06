@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -38,6 +39,10 @@ type Client struct {
 	subscribeID string
 	loginRespCh chan bool // Channel to wait for login response
 
+	// dialing prevents concurrent dialAndLogin calls (gorilla/websocket forbids concurrent read)
+	dialing     int32     // atomic flag: 1 = dialing in progress
+	dialDone    chan struct{} // signaled when dialAndLogin completes
+
 	// readLoopOnce ensures the read loop goroutine is started exactly once.
 	// After initial Connect, the read loop handles all reconnection internally.
 	readLoopStarted bool
@@ -54,6 +59,7 @@ type MiningJob struct {
 	Height       uint64   `json:"height"`
 	PrevHash     string   `json:"prevHash"`
 	MerkleRoot   string   `json:"merkleRoot"`
+	StateRoot    string   `json:"stateRoot"` // World State MPT root hash (required for PoW)
 	Difficulty   *big.Int `json:"difficulty"` // Changed to *big.Int
 	ExtraNonce   string   `json:"extraNonce"`
 	Timestamp    int64    `json:"timestamp"`
@@ -145,7 +151,38 @@ func (c *Client) Connect(ctx context.Context) error {
 // because the readLoop hasn't started yet (initial connect) or is blocked waiting for this
 // function to return (reconnection). Without direct reading, no one processes the WebSocket
 // response and login would always time out.
+//
+// IMPORTANT: This function does NOT set c.conn until AFTER loginSuccess is confirmed.
+// It uses a local newConn variable throughout the login handshake. This prevents a
+// race condition where readLoop picks up the connection mid-login and calls ReadMessage,
+// causing a gorilla/websocket panic ("repeated read on failed websocket connection").
 func (c *Client) dialAndLogin(ctx context.Context) error {
+	// Prevent concurrent dialAndLogin calls (gorilla/websocket forbids concurrent read).
+	// If another goroutine is already dialing, wait for it to complete, then check result.
+	if !atomic.CompareAndSwapInt32(&c.dialing, 0, 1) {
+		// Already dialing — wait for completion, then check if connection succeeded
+		c.log.Debugf("dialAndLogin: already dialing, waiting for completion")
+		<-c.dialDone
+		// After waiting, check if connection is now established
+		c.mu.RLock()
+		conn := c.conn
+		connected := c.connected
+		c.mu.RUnlock()
+		if conn != nil && connected {
+			c.log.Debugf("dialAndLogin: waited for existing dial, connection successful")
+			return nil // Connection succeeded, return nil
+		}
+		// Existing dial failed, return error to let caller retry
+		return fmt.Errorf("previous dial failed, please retry")
+	}
+	// Create fresh dialDone channel for this dial attempt
+	c.dialDone = make(chan struct{})
+	// Defer: reset dialing flag and close dialDone to signal waiters
+	defer func() {
+		atomic.StoreInt32(&c.dialing, 0)
+		close(c.dialDone)
+	}()
+
 	// Parse poolURL to get host
 	parsedURL, err := url.Parse(c.poolURL)
 	if err != nil {
@@ -172,19 +209,15 @@ func (c *Client) dialAndLogin(ctx context.Context) error {
 		Proxy:            nil,
 	}
 
-	conn, _, err := dialer.Dial(c.poolURL, nil)
+	newConn, _, err := dialer.Dial(c.poolURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial pool: %w", err)
 	}
 
-	// Replace old connection
-	c.mu.Lock()
-	if c.conn != nil {
-		c.conn.Close()
-	}
-	c.conn = conn
-	c.connected = false // Not confirmed until loginSuccess
-	c.mu.Unlock()
+	// CRITICAL: Do NOT store newConn in c.conn yet. If readLoop picks it up before
+	// login completes, it will start reading from it, triggering the gorilla/websocket
+	// panic "repeated read on failed websocket connection".
+	// c.conn is only set after loginSuccess is confirmed below.
 
 	// Drain login response channel to remove stale values
 	select {
@@ -192,43 +225,43 @@ func (c *Client) dialAndLogin(ctx context.Context) error {
 	default:
 	}
 
-	// Login to pool
-	if err := c.login(ctx); err != nil {
-		c.mu.Lock()
-		c.connected = false
-		if c.conn != nil {
-			c.conn.Close()
-			c.conn = nil
-		}
-		c.mu.Unlock()
+	// Send login directly on newConn (NOT via sendRequest which uses c.conn).
+	// This avoids exposing newConn to the concurrent readLoop goroutine.
+	loginReq := map[string]interface{}{
+		"method": "login",
+		"params": map[string]string{
+			"address": c.minerAddr,
+		},
+	}
+	loginData, err := json.Marshal(loginReq)
+	if err != nil {
+		newConn.Close()
+		return fmt.Errorf("marshal login: %w", err)
+	}
+	if err := newConn.WriteMessage(websocket.TextMessage, loginData); err != nil {
+		newConn.Close()
 		return fmt.Errorf("send login: %w", err)
 	}
+	c.log.Debugf("Login request sent (direct write)")
 
 	// CRITICAL: Read WebSocket messages directly until loginSuccess is confirmed.
-	// The readLoop is not running (initial connect) or blocked (reconnection),
-	// so we must process messages here to avoid login timeout.
-	// Welcome and other informational messages are processed inline;
-	// subsequent messages are handled by the persistent readLoop after return.
+	// The readLoop is not running (initial connect) or the loop iteration
+	// that called us will continue (reconnection), so we must process messages
+	// here to avoid login timeout.
 	c.log.Debugf("dialAndLogin: waiting for login response (reading WebSocket directly)...")
 	loginDeadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(loginDeadline) {
-		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		if err := newConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			c.log.Debugf("dialAndLogin: setReadDeadline error: %v", err)
 		}
 
-		_, message, err := conn.ReadMessage()
+		_, message, err := newConn.ReadMessage()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue // Timeout but still within login deadline
 			}
 			// Connection error — fail login
-			c.mu.Lock()
-			c.connected = false
-			if c.conn != nil {
-				c.conn.Close()
-				c.conn = nil
-			}
-			c.mu.Unlock()
+			newConn.Close()
 			return fmt.Errorf("read login response: %w", err)
 		}
 
@@ -242,7 +275,14 @@ func (c *Client) dialAndLogin(ctx context.Context) error {
 		method, _ := msg["method"].(string)
 		switch method {
 		case "loginSuccess":
+			// Login confirmed — NOW store the connection in c.conn.
+			// Replacing the old connection under lock ensures readLoop
+			// picks up the confirmed connection atomically.
 			c.mu.Lock()
+			if c.conn != nil {
+				c.conn.Close()
+			}
+			c.conn = newConn
 			c.connected = true
 			c.mu.Unlock()
 			// Notify login response channel (for any concurrent waiters)
@@ -262,26 +302,13 @@ func (c *Client) dialAndLogin(ctx context.Context) error {
 					c.log.Errorf("Pool login error: %s", errMsg)
 				}
 			}
-			// Login failed
-			c.mu.Lock()
-			c.connected = false
-			if c.conn != nil {
-				c.conn.Close()
-				c.conn = nil
-			}
-			c.mu.Unlock()
+			newConn.Close()
 			return fmt.Errorf("login rejected by pool")
 		}
 	}
 
 	// Login deadline expired
-	c.mu.Lock()
-	c.connected = false
-	if c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
-	}
-	c.mu.Unlock()
+	newConn.Close()
 	return fmt.Errorf("login timeout: no login response within 10s")
 }
 
@@ -381,6 +408,13 @@ func (c *Client) readLoop(ctx context.Context) {
 				c.log.Debugf("readLoop: stopCh closed during backoff")
 				return
 			case <-time.After(backoff):
+			}
+
+			// Prevent concurrent dialAndLogin: if already dialing, wait for it to complete
+			if atomic.LoadInt32(&c.dialing) == 1 {
+				c.log.Debugf("readLoop: dialAndLogin already in progress, waiting...")
+				<-c.dialDone
+				continue // Re-check conn after waiting
 			}
 
 			if err := c.dialAndLogin(ctx); err != nil {
@@ -541,6 +575,7 @@ func (c *Client) handleNewJob(msg map[string]interface{}) {
 		Height:       getUint64FromMap(params, "height"),
 		PrevHash:     getStringFromMap(params, "prevHash"),
 		MerkleRoot:   getStringFromMap(params, "merkleRoot"),
+		StateRoot:    getStringFromMap(params, "stateRoot"), // World State MPT root hash
 		Difficulty:   getBigIntFromMap(params, "difficulty"),
 		ExtraNonce:   getStringFromMap(params, "extraNonce"),
 		Timestamp:    getInt64FromMap(params, "timestamp"),

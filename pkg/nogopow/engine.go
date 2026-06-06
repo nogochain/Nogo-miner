@@ -29,6 +29,7 @@ type BlockHeader struct {
 	Height       uint64
 	PrevHash     []byte
 	MerkleRoot   []byte
+	StateRoot    []byte // State root hash for PoW calculation (World State MPT root)
 	Timestamp    int64
 	Difficulty   *big.Int
 	MinerAddress []byte
@@ -165,10 +166,16 @@ func (e *Engine) computeBlockHash(header *BlockHeader, nonce uint64) []byte {
 	root := BytesToHash(header.MerkleRoot)
 
 	// Create header with ALL fields matching the pool/node rlpEncode order
+	// CRITICAL: Root = state root, TxHash = tx root
+	var stateRootHash Hash
+	if len(header.StateRoot) > 0 {
+		copy(stateRootHash[:], header.StateRoot)
+	}
 	blockHeader := &Header{
 		ParentHash: BytesToHash(header.PrevHash),
 		Coinbase:   coinbase,
-		Root:       root,
+		Root:       stateRootHash,       // State root (World State MPT root)
+		TxHash:     root,                // Transactions root (Merkle tree root)
 		Number:     new(big.Int).SetUint64(header.Height),
 		Time:       uint64(header.Timestamp),
 		Nonce:      uint64ToBlockNonce(nonce),
