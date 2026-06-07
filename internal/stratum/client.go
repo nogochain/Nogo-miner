@@ -22,6 +22,8 @@ const (
 	initialReconnectDelay = 1 * time.Second
 	maxReconnectDelay     = 30 * time.Second
 	readDeadlineDuration  = 90 * time.Second // Read deadline for silent disconnection detection
+	writeDeadlineDuration = 2 * time.Second  // Short: broken writes fail fast, don't waste Worker time
+	maxWriteFails         = 2                // Consecutive write failures before forcing reconnect
 )
 
 // Client represents a Stratum client for pool communication
@@ -31,6 +33,7 @@ type Client struct {
 	conn        *websocket.Conn
 	poolURL     string
 	minerAddr   string
+	writeFails  int32 // atomic: consecutive write failures
 	log         Logger
 	connected   bool
 	jobCh       chan *MiningJob
@@ -251,16 +254,15 @@ func (c *Client) dialAndLogin(ctx context.Context) error {
 	c.log.Debugf("dialAndLogin: waiting for login response (reading WebSocket directly)...")
 	loginDeadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(loginDeadline) {
-		if err := newConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		if err := newConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 			c.log.Debugf("dialAndLogin: setReadDeadline error: %v", err)
 		}
 
 		_, message, err := newConn.ReadMessage()
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue // Timeout but still within login deadline
-			}
-			// Connection error — fail login
+			// Any error (including timeout) — close and let readLoop retry with backoff.
+			// Retrying ReadMessage on the same conn after ANY error causes
+			// gorilla/websocket to panic with "repeated read on failed websocket connection".
 			newConn.Close()
 			return fmt.Errorf("read login response: %w", err)
 		}
@@ -360,16 +362,25 @@ func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) er
 	// Use sendMu to prevent concurrent write to WebSocket (gorilla/websocket forbids concurrent write)
 	// This also protects against concurrent writes from pingLoop
 	c.sendMu.Lock()
-	// Set write deadline to prevent indefinite block on broken connection
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration))
 	err = conn.WriteMessage(websocket.TextMessage, data)
 	c.sendMu.Unlock()
 
 	if err != nil {
 		c.log.Errorf("WriteMessage error: %v", err)
+		fails := atomic.AddInt32(&c.writeFails, 1)
+		// Only close after consecutive failures. A single transient error (e.g., brief
+		// network hiccup) should not trigger a full reconnect cycle that loses all in-flight shares.
+		// After maxWriteFails consecutive failures, the connection is truly broken.
+		if int(fails) >= maxWriteFails {
+			conn.Close()
+			atomic.StoreInt32(&c.writeFails, 0)
+			c.log.Warnf("Connection closed after %d consecutive write failures", maxWriteFails)
+		}
 		return err
 	}
-
+	// Successful write resets the failure counter
+	atomic.StoreInt32(&c.writeFails, 0)
 	c.log.Infof(">>> Message sent successfully")
 
 	return nil
@@ -490,11 +501,13 @@ func (c *Client) pingLoop(conn *websocket.Conn, stop <-chan struct{}) {
 			// Lock sendMu to prevent concurrent write with sendRequest
 			// gorilla/websocket forbids concurrent WriteMessage calls
 			c.sendMu.Lock()
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration))
 			err := conn.WriteMessage(websocket.PingMessage, nil)
 			c.sendMu.Unlock()
 			if err != nil {
-				return // Connection lost, stop pinging (readLoop will reconnect)
+				// Don't close on single ping failure — sendRequest's 2-fail counter
+				// is the sole authority for connection health decisions.
+				return
 			}
 		}
 	}

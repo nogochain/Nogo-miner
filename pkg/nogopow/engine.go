@@ -51,6 +51,7 @@ type Engine struct {
 	running   bool
 	hashCount uint64
 	startTime time.Time
+	lastNonce uint64 // Continue from last nonce across Mine() calls, avoids restarting from random
 	cache     *Cache
 }
 
@@ -73,9 +74,14 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 	e.hashCount = 0 // Reset per-session hash counter for accurate hashrate
 	e.mu.Unlock()
 
+	// Use named result so defer can capture last nonce for continuation
+	var lastN uint64
 	defer func() {
 		e.mu.Lock()
 		e.running = false
+		if lastN > e.lastNonce {
+			e.lastNonce = lastN // Continue from here next time
+		}
 		e.mu.Unlock()
 	}()
 
@@ -91,13 +97,22 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 	// Get cache data for this seed (used in computePOW)
 	_ = e.cache.GetData(seed[:])
 
-	// Start from a random nonce to avoid all workers submitting nonce=0
-	startNonce := uint64(time.Now().UnixNano() % 1000000)
+	// Start from the last tried nonce to avoid re-scanning the same range
+	// across Mine() calls. When timeout fires, the next call picks up where
+	// left off instead of starting from a random nonce.
+	e.mu.Lock()
+	startNonce := e.lastNonce
+	if startNonce == 0 {
+		// First ever Mine() call, start from random to avoid all workers trying nonce=0
+		startNonce = uint64(time.Now().UnixNano() % 1000000)
+	}
+	e.mu.Unlock()
 
 	// Try nonces until we find a valid one or are stopped
 	for nonce := startNonce; nonce < MaxNonce; nonce++ {
 		select {
 		case <-stopCh:
+			lastN = nonce // Save for next Mine() call continuation
 			return &MiningResult{
 				Nonce:       nonce,
 				BlockHash:   nil,
@@ -116,8 +131,7 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 		// Check if hash meets target
 		hashBig := new(big.Int).SetBytes(blockHash)
 		if hashBig.Cmp(target) <= 0 {
-			// Found valid hash! Moved to miner-level logging to avoid TUI corruption.
-
+			lastN = nonce + 1 // Next call starts after this nonce
 			return &MiningResult{
 				Nonce:       nonce,
 				BlockHash:   blockHash,
@@ -133,7 +147,8 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 		e.mu.Unlock()
 	}
 
-	// Exhausted all nonces without finding solution
+	// Exhausted all nonces without finding solution — wrap around
+	lastN = 0 // Restart from 0 next time
 	return &MiningResult{
 		Nonce:       MaxNonce,
 		BlockHash:   nil,

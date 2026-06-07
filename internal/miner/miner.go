@@ -173,8 +173,9 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 	// Create stop channel for this mining session
 	mineStopCh := make(chan struct{})
 
-	// Set timeout for mining (e.g., 10 seconds)
-	timeout := time.AfterFunc(10*time.Second, func() {
+	// Set timeout for mining. At 3 H/s and diff 100, ~33s to find one.
+	// 30s gives ~60% chance per window while still reacting to new jobs promptly.
+	timeout := time.AfterFunc(30*time.Second, func() {
 		close(mineStopCh)
 	})
 	defer timeout.Stop()
@@ -235,7 +236,7 @@ func (m *Miner) listenForResult() {
 
 	resultCh := client.GetResultChannel()
 
-	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 	defer cancel()
 
 	select {
@@ -278,7 +279,7 @@ func (m *Miner) submitSolution(result *nogopow.MiningResult, job *MiningJob) {
 	}
 
 	// Submit share to pool via Stratum client
-	ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 3*time.Second)
 	defer cancel()
 
 	if err := client.SubmitShare(ctx, job.JobIDNum, result.Nonce); err != nil {
