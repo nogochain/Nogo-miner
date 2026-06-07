@@ -170,17 +170,10 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 	atomic.StoreInt32(&w.isMining, 1)
 	defer atomic.StoreInt32(&w.isMining, 0)
 
-	// Create stop channel for this mining session
-	mineStopCh := make(chan struct{})
-
-	// Set timeout for mining. At 3 H/s and diff 100, ~33s to find one.
-	// 30s gives ~60% chance per window while still reacting to new jobs promptly.
-	timeout := time.AfterFunc(30*time.Second, func() {
-		close(mineStopCh)
-	})
-	defer timeout.Stop()
-
-	// Start mining with the new engine API
+	// No timeout — mine continuously until solution found.
+	// Between blocks, the Pool only sends jobs for actual new blocks (not difficulty
+	// changes). The engine continues scanning nonces uninterrupted.
+	mineStopCh := make(chan struct{}) // never closed, engine runs until solution
 	// CRITICAL: Must include StateRoot to match node's Header.Root (state root)
 	// Note: TxHash is calculated from MerkleRoot inside engine.Mine()
 	result := w.engine.Mine(&nogopow.BlockHeader{
