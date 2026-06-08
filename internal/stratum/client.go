@@ -217,6 +217,17 @@ func (c *Client) dialAndLogin(ctx context.Context) error {
 		return fmt.Errorf("dial pool: %w", err)
 	}
 
+	// FIX: Set pong handler to refresh read deadline and keep connection alive.
+	// Without this, the read deadline (90s) will expire even if the connection is healthy,
+	// causing unnecessary disconnections. The pong handler is called automatically
+	// when the pool responds to our ping with a pong.
+	newConn.SetReadDeadline(time.Now().Add(readDeadlineDuration))
+	newConn.SetPongHandler(func(string) error {
+		newConn.SetReadDeadline(time.Now().Add(readDeadlineDuration))
+		c.log.Debugf("Pong received, read deadline refreshed")
+		return nil
+	})
+
 	// CRITICAL: Do NOT store newConn in c.conn yet. If readLoop picks it up before
 	// login completes, it will start reading from it, triggering the gorilla/websocket
 	// panic "repeated read on failed websocket connection".
@@ -449,10 +460,11 @@ func (c *Client) readLoop(ctx context.Context) {
 			continue
 		}
 
-		// Start ping goroutine for this connection
-		pingStop := make(chan struct{})
-		go c.pingLoop(conn, pingStop)
-		defer close(pingStop) // Always stop pinger when this connection ends
+		// FIXED: Create cancellable context for pingLoop
+		// CRITICAL: pingCancel MUST be called before continuing to next iteration,
+		// otherwise old pingLoop will run with stale connection after reconnect.
+		pingCtx, pingCancel := context.WithCancel(ctx)
+		go c.pingLoop(conn, pingCtx)
 
 		// Set read deadline to detect silent disconnections
 		// (e.g., network partition, pool crash without TCP RST)
@@ -461,6 +473,10 @@ func (c *Client) readLoop(ctx context.Context) {
 		}
 
 		_, message, err := conn.ReadMessage()
+		
+		// STOP pingLoop before processing read error or continuing to next iteration
+		pingCancel()
+		
 		if err != nil {
 			c.log.Errorf("readLoop: read error: %v", err)
 			c.mu.Lock()
@@ -486,13 +502,15 @@ func (c *Client) readLoop(ctx context.Context) {
 // pingLoop sends periodic WebSocket ping frames to keep the connection alive.
 // NAT gateways and firewalls typically drop idle TCP connections after 60-120s.
 // Sending a ping every 25 seconds prevents this without the 90s readDeadline timeout.
-func (c *Client) pingLoop(conn *websocket.Conn, stop <-chan struct{}) {
+func (c *Client) pingLoop(conn *websocket.Conn, ctx context.Context) {
 	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-stop:
+		case <-ctx.Done():
+			// FIXED: Context cancellation stops this goroutine
+			log.Printf("pingLoop: context cancelled, stopping")
 			return
 		case <-ticker.C:
 			if conn == nil {

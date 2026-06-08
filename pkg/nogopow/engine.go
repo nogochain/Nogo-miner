@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -213,9 +214,35 @@ func (e *Engine) computePoW(blockHash, seed Hash) Hash {
 }
 
 // difficultyToTarget converts difficulty to target threshold
+// P1 Issue 3.4: Possible integer overflow in difficultyToTarget
+// CRITICAL FIX: Add zero check and boundary conditions
 func difficultyToTarget(difficulty *big.Int) *big.Int {
+	// P1 Issue 3.4 FIX: Check for nil or zero difficulty
+	if difficulty == nil || difficulty.Sign() <= 0 {
+		// Return max target (easiest difficulty) if difficulty is invalid
+		maxTarget := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+		return maxTarget
+	}
+	
+	// Calculate max target: 2^256 - 1
 	maxTarget := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	
+	// P1 Issue 3.4 FIX: Check for overflow - if difficulty is very small, target could overflow
+	// In practice, difficulty should never be < 1 (which would make target > 2^256)
+	if difficulty.Cmp(big.NewInt(1)) < 0 {
+		// Difficulty too small, return max target
+		return maxTarget
+	}
+	
+	// Calculate target = maxTarget / difficulty
 	target := new(big.Int).Div(maxTarget, difficulty)
+	
+	// P1 Issue 3.4 FIX: Ensure target is not zero (would make mining impossible)
+	if target.Sign() == 0 {
+		// Return minimum target (hardest difficulty)
+		return big.NewInt(1)
+	}
+	
 	return target
 }
 
@@ -240,9 +267,7 @@ func seedFromParent(prevHash []byte) Hash {
 }
 
 // decodeMinerAddress decodes a miner address from NOGO-format hex string to 20-byte Address.
-// The miner receives the address as raw ASCII bytes from the Stratum job (e.g., "NOGO00ec...").
-// This function strips the "NOGO" prefix, hex-decodes, and extracts the first 20 bytes,
-// matching the pool's stringToAddress implementation exactly.
+// This function EXACTLY matches the node's stringToAddress implementation.
 func decodeMinerAddress(addrBytes []byte) Address {
 	var result Address
 
@@ -252,21 +277,25 @@ func decodeMinerAddress(addrBytes []byte) Address {
 
 	addrStr := string(addrBytes)
 
-	// Strip "NOGO" prefix if present (matches pool stringToAddress)
-	if len(addrStr) >= 4 && addrStr[:4] == "NOGO" {
-		addrStr = addrStr[4:]
+	// EXACT copy from node's stringToAddress (genesis.go:748-767)
+	// Check if address has "NOGO" prefix
+	if strings.HasPrefix(addrStr, "NOGO") {
+		encoded := addrStr[4:]
+		decoded, err := hex.DecodeString(encoded)
+		if err != nil || len(decoded) < 33 {
+			return result
+		}
+		// Node copies decoded[1:33] (skip byte 0, take bytes 1-32)
+		if len(decoded) == 37 {
+			copy(result[:], decoded[1:33])
+		}
+	} else {
+		decoded, err := hex.DecodeString(addrStr)
+		if err != nil || len(decoded) != 32 {
+			return result
+		}
+		copy(result[:], decoded)
 	}
-
-	// Hex-decode the remaining string
-	decoded, err := hex.DecodeString(addrStr)
-	if err != nil || len(decoded) < 20 {
-		// Return zero address on decode failure — the resulting sealHash
-		// will not match pool verification, which is the correct behavior
-		// for invalid miner addresses
-		return result
-	}
-
-	copy(result[:], decoded[:20])
 	return result
 }
 

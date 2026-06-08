@@ -207,7 +207,12 @@ func (w *Worker) logHashRate(hashRate float64, duration time.Duration, hashes ui
 }
 
 // handleSuccess handles a successful mining result
+// P1 Issue 3.2: Race condition between submitSolution and handleSuccess
+// CRITICAL FIX: Add mutex to prevent concurrent submission
 func (m *Miner) handleSuccess(worker *Worker, result *nogopow.MiningResult, job *MiningJob) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
 	m.log.Infof("Worker %d found solution! Nonce: %d, Hashes: %d, JobID: %d",
 		worker.id, result.Nonce, result.HashesTried, job.JobIDNum)
 
@@ -299,11 +304,20 @@ func (m *Miner) monitorJobs() {
 	for {
 		client := m.poolManager.GetClient()
 		if client == nil {
-			m.log.Debug("No pool client available for job fetch, retrying in 15s")
+			m.log.Warn("⚠️ Pool client disconnected! Stopping mining...")
+
+			// FIX: Clear currentJob so workers stop mining on stale job
+			// Without this, workers continue mining on old job even after disconnect,
+			// wasting hashrate on shares that can never be submitted.
+			m.jobMu.Lock()
+			m.currentJob = nil
+			m.jobMu.Unlock()
+
+			m.log.Debug("No pool client available, retrying in 1s")
 			select {
 			case <-m.ctx.Done():
 				return
-			case <-refetchTicker.C:
+			case <-time.After(1 * time.Second):  // FIXED: 1s sleep prevents CPU spin
 				continue
 			}
 		}

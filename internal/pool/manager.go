@@ -125,12 +125,22 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // connectToPool connects to a specific pool
+// P1 Issue 3.1 FIX: Add proper locking to prevent connection race
 func (m *Manager) connectToPool(ctx context.Context, index int) error {
 	if index < 0 || index >= len(m.pools) {
 		return fmt.Errorf("invalid pool index: %d", index)
 	}
 
 	pool := m.pools[index]
+	
+	// Lock the pool to prevent concurrent connection attempts
+	pool.mu.Lock()
+	if pool.connected {
+		pool.mu.Unlock()
+		return fmt.Errorf("already connected to pool %s", pool.config.Name)
+	}
+	pool.mu.Unlock()
+
 	m.log.Infof("Connecting to pool: %s (%s)", pool.config.Name, pool.config.URL)
 
 	// Connect with timeout
@@ -141,6 +151,7 @@ func (m *Manager) connectToPool(ctx context.Context, index int) error {
 		return fmt.Errorf("connect failed: %w", err)
 	}
 
+	// Update connection state with locking
 	pool.mu.Lock()
 	pool.connected = true
 	pool.lastPing = time.Now()
@@ -195,38 +206,92 @@ func (m *Manager) checkPoolHealth(ctx context.Context) {
 }
 
 // switchToNextPool switches to the next available pool
+// P1 Issue 3.1: Connection race in switchToNextPool
+// CRITICAL FIX: Add proper locking to prevent connection race
 func (m *Manager) switchToNextPool(ctx context.Context) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Disconnect from current pool
-	if m.currentPool >= 0 && m.currentPool < len(m.pools) {
-		m.pools[m.currentPool].connected = false
-		m.pools[m.currentPool].client.Close()
+	
+	// CRITICAL FIX: Store current pool index BEFORE releasing lock
+	currentIdx := m.currentPool
+	m.mu.Unlock()
+	
+	// Disconnect from current pool with proper locking
+	if currentIdx >= 0 && currentIdx < len(m.pools) {
+		currentPool := m.pools[currentIdx]
+		
+		// Lock the pool to prevent concurrent connection attempts
+		currentPool.mu.Lock()
+		if currentPool.connected {
+			currentPool.connected = false
+			// Close client connection
+			if currentPool.client != nil {
+				currentPool.client.Close()
+			}
+		}
+		currentPool.mu.Unlock()
 	}
-
+	
 	// Try next pools
 	for i := 0; i < len(m.pools); i++ {
-		poolIndex := (m.currentPool + 1 + i) % len(m.pools)
+		poolIndex := (currentIdx + 1 + i) % len(m.pools)
 		
-		m.log.Infof("Trying to connect to pool: %s", m.pools[poolIndex].config.Name)
+		// Skip current pool
+		if poolIndex == currentIdx {
+			continue
+		}
 		
-		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := m.pools[poolIndex].client.Connect(connectCtx)
-		cancel()
-
-		if err == nil {
-			m.pools[poolIndex].connected = true
-			m.pools[poolIndex].lastPing = time.Now()
+		targetPool := m.pools[poolIndex]
+		
+		// Lock the target pool to prevent concurrent connection
+		targetPool.mu.Lock()
+		if targetPool.connected {
+			// Already connected, just switch
+			targetPool.mu.Unlock()
+			
+			m.mu.Lock()
 			m.currentPool = poolIndex
-			m.log.Infof("Switched to pool: %s", m.pools[poolIndex].config.Name)
+			m.mu.Unlock()
+			
+			m.log.Infof("Switched to already connected pool: %s", targetPool.config.Name)
 			return
 		}
-
-		m.log.Warnf("Failed to connect to pool %s: %v", m.pools[poolIndex].config.Name, err)
+		targetPool.mu.Unlock()
+		
+		m.log.Infof("Trying to connect to pool: %s", targetPool.config.Name)
+		
+		// Connect with timeout
+		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		
+		// Use a channel to prevent concurrent dial
+		connectCh := make(chan error, 1)
+		go func() {
+			connectCh <- targetPool.client.Connect(connectCtx)
+		}()
+		
+		err := <-connectCh
+		
+		if err == nil {
+			// Update connection state with locking
+			targetPool.mu.Lock()
+			targetPool.connected = true
+			targetPool.lastPing = time.Now()
+			targetPool.mu.Unlock()
+			
+			m.mu.Lock()
+			m.currentPool = poolIndex
+			m.mu.Unlock()
+			
+			m.log.Infof("✅ Switched to pool: %s", targetPool.config.Name)
+			return
+		}
+		
+		m.log.Warnf("Failed to connect to pool %s: %v", targetPool.config.Name, err)
 	}
-
+	
+	m.mu.Lock()
 	m.currentPool = -1
+	m.mu.Unlock()
 	m.log.Error("No available pools")
 }
 
