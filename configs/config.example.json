@@ -1,7 +1,7 @@
 {
   "rpc": {
     "url": "http://localhost:1818",
-    "ws_url": "ws://localhost:1819/stratum",
+    "ws_url": "ws://localhost:1818/stratum",
     "timeout_seconds": 30,
     "max_retries": 5,
     "retry_delay_seconds": 2
@@ -10,7 +10,7 @@
     {
       "name": "NogoPool",
       "url": "http://localhost:1818",
-      "ws_url": "ws://localhost:1819/stratum",
+      "ws_url": "ws://localhost:1818/stratum",
       "address": "NOGO<your_address_here>",
       "priority": 1,
       "enabled": true

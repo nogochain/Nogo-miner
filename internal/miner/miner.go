@@ -170,12 +170,8 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 	atomic.StoreInt32(&w.isMining, 1)
 	defer atomic.StoreInt32(&w.isMining, 0)
 
-	// No timeout — mine continuously until solution found.
-	// Between blocks, the Pool only sends jobs for actual new blocks (not difficulty
-	// changes). The engine continues scanning nonces uninterrupted.
-	mineStopCh := make(chan struct{}) // never closed, engine runs until solution
-	// CRITICAL: Must include StateRoot to match node's Header.Root (state root)
-	// Note: TxHash is calculated from MerkleRoot inside engine.Mine()
+	// Use worker's stopCh for job switching: when handleNewJob closes stopCh,
+	// engine.Mine() returns immediately, and the worker picks up the new job.
 	result := w.engine.Mine(&nogopow.BlockHeader{
 		Height:       job.Template.Height,
 		PrevHash:     job.Template.PrevHash,
@@ -185,7 +181,7 @@ func (w *Worker) mine(job *MiningJob) *nogopow.MiningResult {
 		Difficulty:   job.Template.Difficulty,
 		MinerAddress: job.Template.MinerAddress,
 		ChainID:      job.Template.ChainID,
-	}, mineStopCh)
+	}, w.stopCh)
 
 	if result == nil {
 		return nil
@@ -421,6 +417,7 @@ func (m *Miner) handleNewJob(job *stratum.MiningJob) {
 		ChainID:      1, // Default chain ID
 	}
 
+	// Store new job (must happen BEFORE signaling workers so they see the new job)
 	m.jobMu.Lock()
 	m.currentJob = &MiningJob{
 		Template:   template,
@@ -432,7 +429,24 @@ func (m *Miner) handleNewJob(job *stratum.MiningJob) {
 	}
 	m.jobMu.Unlock()
 
-	m.log.Infof("Updated mining job: height=%d, target=%s", job.Height, job.PrevHash)
+	// CRITICAL: Signal all workers to stop current mining and switch to new job.
+	// Without this, workers remain blocked in engine.Mine() on the old job
+	// until they happen to find a valid nonce — which could take hours at
+	// high difficulty. During that time, the chain advances and all found
+	// shares are stale (submitted for wrong height).
+	for _, worker := range m.workers {
+		select {
+		case <-worker.stopCh:
+			// Already closed, create a new one
+			worker.stopCh = make(chan struct{})
+		default:
+			// Close current stopCh to stop mining, will create new one in loop
+			close(worker.stopCh)
+			worker.stopCh = make(chan struct{})
+		}
+	}
+
+	m.log.Infof("Updated mining job: height=%d, target=%s. Workers restarted.", job.Height, job.PrevHash)
 }
 
 // Stop stops the miner

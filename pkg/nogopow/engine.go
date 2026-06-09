@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -267,7 +266,8 @@ func seedFromParent(prevHash []byte) Hash {
 }
 
 // decodeMinerAddress decodes a miner address from NOGO-format hex string to 20-byte Address.
-// This function EXACTLY matches the node's stringToAddress implementation.
+// This function MUST match the node's core.StringToAddress (core/types.go:1120-1142) EXACTLY.
+// Any mismatch will cause SealHash inconsistency and PoW verification failure.
 func decodeMinerAddress(addrBytes []byte) Address {
 	var result Address
 
@@ -276,26 +276,24 @@ func decodeMinerAddress(addrBytes []byte) Address {
 	}
 
 	addrStr := string(addrBytes)
+	encoded := addrStr
 
-	// EXACT copy from node's stringToAddress (genesis.go:748-767)
-	// Check if address has "NOGO" prefix
-	if strings.HasPrefix(addrStr, "NOGO") {
-		encoded := addrStr[4:]
-		decoded, err := hex.DecodeString(encoded)
-		if err != nil || len(decoded) < 33 {
-			return result
-		}
-		// Node copies decoded[1:33] (skip byte 0, take bytes 1-32)
-		if len(decoded) == 37 {
-			copy(result[:], decoded[1:33])
-		}
-	} else {
-		decoded, err := hex.DecodeString(addrStr)
-		if err != nil || len(decoded) != 32 {
-			return result
-		}
-		copy(result[:], decoded)
+	// Match node's core.StringToAddress exactly:
+	// 1. Strip NOGO prefix if present
+	// 2. Hex decode
+	// 3. Copy first 20 bytes (MUST match node exactly)
+	if len(addrStr) >= 4 && addrStr[:4] == "NOGO" {
+		encoded = addrStr[4:]
 	}
+
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil || len(decoded) < 20 {
+		return result
+	}
+
+	// CRITICAL: Must match node's core.StringToAddress exactly
+	// Node uses: copy(result[:], decoded[:20])
+	copy(result[:], decoded[:20])
 	return result
 }
 
