@@ -691,6 +691,19 @@ func (c *Client) GetCurrentJob() *MiningJob {
 	return c.lastJob
 }
 
+// SendHashReport sends a hash count report to the pool.
+// The pool uses these reports to track total hashes per miner for reward distribution.
+// Each call should send the INCREMENTAL hashes since the last report, not the cumulative total.
+func (c *Client) SendHashReport(ctx context.Context, hashes uint64) error {
+	req := map[string]interface{}{
+		"method": "hashReport",
+		"params": map[string]interface{}{
+			"hashes": hashes,
+		},
+	}
+	return c.sendRequest(ctx, req)
+}
+
 // SubmitShare submits a share to the pool
 func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
 	req := map[string]interface{}{

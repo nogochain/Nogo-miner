@@ -41,6 +41,10 @@ type Miner struct {
 	jobMu         sync.RWMutex
 	submittedWork uint64
 	acceptedWork  uint64
+
+	// Hash report for pool-based reward tracking
+	lastReportedHashes uint64
+	hashReportStopCh   chan struct{}
 }
 
 // MinerConfig represents miner configuration
@@ -73,13 +77,14 @@ func NewMiner(cfg *MinerConfig, poolMgr *pool.Manager, mon *monitor.Monitor, log
 	ctx, cancel := context.WithCancel(context.Background())
 
 	miner := &Miner{
-		config:      cfg,
-		poolManager: poolMgr,
-		monitor:     mon,
-		log:         log,
-		ctx:         ctx,
-		cancel:      cancel,
-		workers:     make([]*Worker, 0, cfg.Threads),
+		config:           cfg,
+		poolManager:      poolMgr,
+		monitor:          mon,
+		log:              log,
+		ctx:              ctx,
+		cancel:           cancel,
+		workers:          make([]*Worker, 0, cfg.Threads),
+		hashReportStopCh: make(chan struct{}),
 	}
 
 	// Create workers
@@ -118,6 +123,10 @@ func (m *Miner) Start() error {
 
 	// Start job monitor
 	go m.monitorJobs()
+
+	// Start hash report loop (sends periodic hash count to pool)
+	m.hashReportStopCh = make(chan struct{})
+	go m.hashReportLoop()
 
 	m.running = true
 	m.log.Info("Miner started")
@@ -208,7 +217,7 @@ func (w *Worker) logHashRate(hashRate float64, duration time.Duration, hashes ui
 func (m *Miner) handleSuccess(worker *Worker, result *nogopow.MiningResult, job *MiningJob) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	m.log.Infof("Worker %d found solution! Nonce: %d, Hashes: %d, JobID: %d",
 		worker.id, result.Nonce, result.HashesTried, job.JobIDNum)
 
@@ -219,6 +228,45 @@ func (m *Miner) handleSuccess(worker *Worker, result *nogopow.MiningResult, job 
 
 	// Listen for submission result
 	go m.listenForResult()
+}
+
+// hashReportLoop sends periodic hash count reports to the pool every 30 seconds.
+// Uses delta-based reporting: sends only the incremental hashes since last report,
+// preventing double-counting. The pool accumulates these reports as TotalHashes.
+func (m *Miner) hashReportLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.hashReportStopCh:
+			return
+		case <-ticker.C:
+			client := m.poolManager.GetClient()
+			if client == nil {
+				continue
+			}
+
+			totalHashes := m.GetStats().TotalHashes
+			if totalHashes <= m.lastReportedHashes {
+				continue // No new hashes to report
+			}
+			increment := totalHashes - m.lastReportedHashes
+			m.lastReportedHashes = totalHashes
+
+			ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+			err := client.SendHashReport(ctx, increment)
+			cancel()
+
+			if err != nil {
+				m.log.Debugf("Failed to send hash report: %v", err)
+			} else {
+				m.log.Debugf("Hash report sent: +%d hashes", increment)
+			}
+		}
+	}
 }
 
 // listenForResult listens for share submission results
@@ -294,9 +342,6 @@ func (m *Miner) monitorJobs() {
 	refetchTicker := time.NewTicker(15 * time.Second)
 	defer refetchTicker.Stop()
 
-	// Job expiry: discard jobs older than 10 minutes to prevent stale mining
-	const jobExpiryDuration = 10 * time.Minute
-
 	for {
 		client := m.poolManager.GetClient()
 		if client == nil {
@@ -313,7 +358,7 @@ func (m *Miner) monitorJobs() {
 			select {
 			case <-m.ctx.Done():
 				return
-			case <-time.After(1 * time.Second):  // FIXED: 1s sleep prevents CPU spin
+			case <-time.After(1 * time.Second):
 				continue
 			}
 		}
@@ -328,7 +373,6 @@ func (m *Miner) monitorJobs() {
 			case <-m.ctx.Done():
 				return
 			case <-refetchTicker.C:
-				// Periodically check if the client has changed (pool switch)
 				currentClient := m.poolManager.GetClient()
 				if currentClient != client {
 					m.log.Debugf("monitorJobs: pool client changed, re-fetching job channel")
@@ -338,12 +382,6 @@ func (m *Miner) monitorJobs() {
 				if !ok {
 					m.log.Warn("Job channel closed, re-fetching client")
 					break innerLoop
-				}
-
-				// Discard stale jobs beyond expiry threshold
-				if time.Since(time.Unix(job.Timestamp, 0)) > jobExpiryDuration {
-					m.log.Debugf("Skipping expired job: height=%d, timestamp=%d", job.Height, job.Timestamp)
-					continue
 				}
 
 				m.handleNewJob(job)
@@ -470,6 +508,13 @@ func (m *Miner) Stop() error {
 		default:
 			close(worker.stopCh)
 		}
+	}
+
+	// Stop hash report loop
+	select {
+	case <-m.hashReportStopCh:
+	default:
+		close(m.hashReportStopCh)
 	}
 
 	// Stop pool manager

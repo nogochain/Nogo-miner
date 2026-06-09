@@ -234,9 +234,11 @@ func (m *Manager) switchToNextPool(ctx context.Context) {
 	// Try next pools
 	for i := 0; i < len(m.pools); i++ {
 		poolIndex := (currentIdx + 1 + i) % len(m.pools)
-		
-		// Skip current pool
-		if poolIndex == currentIdx {
+
+		// Skip current pool only when there are other pools to try.
+		// When only one pool is configured, reconnect to the same pool
+		// instead of falling through to currentPool = -1.
+		if poolIndex == currentIdx && len(m.pools) > 1 {
 			continue
 		}
 		
