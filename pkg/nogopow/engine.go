@@ -388,19 +388,6 @@ func BytesToHash(b []byte) Hash {
 	return h
 }
 
-// GetHashRate returns current hash rate in hashes per second
-func (e *Engine) GetHashRate() uint64 {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	elapsed := time.Since(e.startTime)
-	if elapsed == 0 {
-		return 0
-	}
-
-	return uint64(float64(e.hashCount) / elapsed.Seconds())
-}
-
 // Stop stops the mining engine
 func (e *Engine) Stop() {
 	e.mu.Lock()

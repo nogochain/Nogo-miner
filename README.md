@@ -38,7 +38,7 @@ Nogo-miner is the official mining software for NogoChain, implementing the compl
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     Nogo-miner                           │
+│                     NogoMiner v1.0.0                     │
 ├─────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
 │  │   Config    │  │   Logger    │  │   Monitor   │     │
@@ -49,17 +49,17 @@ Nogo-miner is the official mining software for NogoChain, implementing the compl
 │  │  (HTTP/WS)  │  │ (Failover)  │  │  Client     │     │
 │  └─────────────┘  └─────────────┘  └─────────────┘     │
 │  ┌─────────────────────────────────────────────────┐   │
-│  │         NogoPow Engine (256×256 Matrix)         │   │
-│  │  - Cache System  - Parallel Computation         │   │
+│  │         NogoPow Engine                          │   │
+│  │  - Seed Cache  - Parallel Computation (4-way)   │   │
 │  │  - Difficulty Adj - Share Validation            │   │
+│  │  - XOR Mixing   - Matrix Operations             │   │
 │  └─────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────┘
                           │
-                          │ Stratum Protocol / WebSocket
+                          │ WebSocket / Stratum Protocol
                           ▼
               ┌───────────────────────┐
               │    NogoPool Server    │
-              │  or  NogoChain Node   │
               └───────────────────────┘
 ```
 
@@ -70,34 +70,36 @@ Nogo-miner is the official mining software for NogoChain, implementing the compl
 ### Core Features
 
 - **Full NogoPow Algorithm**: Exact implementation matching NogoChain nodes
-  - 256×256 matrix multiplication
-  - 30-bit fixed-point arithmetic
-  - Intelligent seed cache mechanism
-  - Difficulty adjustment (PI controller compatible)
+  - Seed-based cache computation
+  - XOR mixing with header hash
+  - Dynamic difficulty verification
+  - Share-level PoW validation
 
 - **High-Performance Mining**
-  - Multi-core CPU parallel computing (4-way parallelism)
-  - Optimized blocked matrix multiplication
+  - Multi-core CPU parallel computing (configurable threads)
+  - Optimized matrix operations
   - Memory pool for object reuse
-  - Configurable thread count
+  - Configurable batch size
 
 - **Mining Pool Support**
   - Stratum protocol over WebSocket
-  - Multiple pool failover support
-  - Automatic reconnection with exponential backoff
-  - Share difficulty adjustment
+  - Multiple pool failover with priority support
+  - Automatic reconnection with exponential backoff (2s-60s)
+  - Health check loop with reconnection detection
+  - Share difficulty acceptance
 
 - **Production-Ready**
+  - Race-condition-free connection lifecycle (readLoopDone synchronization)
+  - Duplicate readLoop goroutine prevention (IsReconnecting guard)
   - Comprehensive error handling
   - Resource management with cleanup
-  - Concurrency safety (race detection passed)
-  - Logging with rotation
+  - Concurrency safety (c.mu/sendMu layered locking)
 
 - **Monitoring & Metrics**
-  - Real-time hashrate display
-  - Accepted/rejected share tracking
-  - Prometheus metrics export (optional)
-  - Detailed logging
+  - Real-time hashrate display (5s refresh)
+  - Accepted/rejected/invalid share tracking
+  - Miner uptime and worker status display
+  - Detailed logging with rotation
 
 ---
 
@@ -569,63 +571,43 @@ curl http://localhost:1818/api/stats
 
 ### Algorithm Overview
 
-NogoPow is NogoChain's proof-of-work algorithm, based on memory-intensive matrix operations:
+NogoPow is NogoChain's proof-of-work algorithm, featuring seed-based cache computation with XOR mixing:
 
 ```
-Block Header → RLP Encoding → Keccak-256 → Matrix Operations → PoW Hash
+Block Header → HeaderHash → Seed Cache Generation → XOR Mixing → PoW Hash → Difficulty Check
 ```
 
 ### Key Parameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Matrix Size | 256×256 | Matrix dimensions |
-| Fixed-Point Precision | 2^30 | 30-bit precision |
-| Cache Items | 64 | LRU cache size |
-| Parallel Workers | 4 | Goroutine count |
+| Seed Size | Configurable | Seed bytes for cache generation |
+| XOR Rounds | 8 rounds | Mixing iterations |
+| Concurrent Workers | Configurable (default: 4) | Parallel computation threads |
+| Write Deadline | 5 seconds | Fast failure for broken connections |
+| Read Deadline | 120 seconds | Silent disconnection detection |
 
 ### Core Implementation
 
 ```go
-// Compute PoW
-func computePoW(blockHash, seed Hash) Hash {
-    cacheData := cache.GetData(seed.Bytes())
-    result := mulMatrix(blockHash.Bytes(), cacheData)
-    return hashMatrix(result)
-}
+// Engine.Mine performs the core mining loop
+func (e *Engine) Mine(headerHash []byte, seed []byte, difficulty uint64, 
+    nonceStart uint64, nonceEnd uint64, resultCh chan *MiningResult)
 
-// Matrix Multiplication (blocked algorithm)
-func mulMatrix(headerHash []byte, cache []uint32) []uint8 {
-    // 4-way parallel computation
-    // 32×32 blocked matrix multiplication
-    // Fixed-point arithmetic (2^30)
-}
-```
-
-### Difficulty Calculation
-
-```go
-// Target calculation
-func difficultyToTarget(difficulty *big.Int) *big.Int {
-    maxTarget := new(big.Int).Sub(
-        new(big.Int).Lsh(big.NewInt(1), 256), 
-        big.NewInt(1)
-    )
-    target := new(big.Int).Div(maxTarget, difficulty)
-    return target
-}
+// Engine.VerifyPoW verifies a computed PoW solution
+func (e *Engine) VerifyPoW(headerHash []byte, seed []byte, 
+    nonce uint64, difficulty uint64) bool
 ```
 
 ### Algorithm Consistency
 
 Nogo-miner maintains exact consistency with NogoChain nodes:
 
-- ✅ Matrix size: 256×256
-- ✅ Fixed-point precision: 30 bits
-- ✅ Cache mechanism: LRU with 64 items
-- ✅ Hash algorithm: Keccak-256
-- ✅ RLP encoding: Identical to node implementation
-- ✅ Difficulty adjustment: PI controller compatible
+- ✅ Seed cache computation: Identical to node implementation
+- ✅ XOR mixing operations: 8 rounds, matching consensus
+- ✅ Difficulty target calculation: Dynamic, node-compatible
+- ✅ Share validation: Full PoW verification
+- ✅ Header hash computation: Same as consensus layer
 
 ### Performance Benchmarks
 
@@ -633,10 +615,10 @@ Nogo-miner maintains exact consistency with NogoChain nodes:
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Hashrate | 1.2-1.5 KH/s | 4 threads |
-| Matrix Ops/sec | ~1500 | 256×256 multiplications |
+| Hashrate | 1-50 H/s | Depends on difficulty |
 | Memory Usage | 200-400 MB | Stable |
 | CPU Utilization | 80-90% | Memory bandwidth limited |
+| Reconnection Backoff | 2s-60s | Exponential |
 
 ---
 
@@ -996,40 +978,82 @@ dlv debug ./cmd/nogominer
 
 ### Internal APIs (for developers)
 
-#### RPC Client
-
-```go
-// Get block template
-func (c *Client) GetBlockTemplate(ctx context.Context) (*BlockTemplate, error)
-
-// Submit work
-func (c *Client) SubmitWork(ctx context.Context, req SubmitWorkRequest) (*SubmitWorkResponse, error)
-```
-
 #### Stratum Client
 
 ```go
-// Connect to pool
+// Connect establishes WebSocket connection and starts readLoop
 func (c *Client) Connect(ctx context.Context) error
 
-// Subscribe to jobs
-func (c *Client) Subscribe(ctx context.Context) (<-chan *MiningJob, error)
+// Close permanently stops readLoop and waits for cleanup
+func (c *Client) Close() error
 
-// Submit share
-func (c *Client) SubmitShare(ctx context.Context, jobID uint64, nonce uint64) error
+// IsConnected returns current connection status
+func (c *Client) IsConnected() bool
+
+// IsReconnecting returns true if dialAndLogin is in progress
+func (c *Client) IsReconnecting() bool
+
+// SubmitShare submits a share to the pool
+func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error
+
+// SendHashReport sends incremental hash count to pool
+func (c *Client) SendHashReport(ctx context.Context, hashes uint64) error
+
+// GetJobChannel returns the job channel for receiving mining jobs
+func (c *Client) GetJobChannel() <-chan *MiningJob
+
+// GetResultChannel returns the result channel for submission results
+func (c *Client) GetResultChannel() <-chan *SubmitResult
+
+// GetCurrentJob returns the current mining job
+func (c *Client) GetCurrentJob() *MiningJob
+```
+
+#### NogoPow Engine
+
+```go
+// Mine performs the core mining loop
+func (e *Engine) Mine(headerHash []byte, seed []byte, difficulty uint64,
+    nonceStart uint64, nonceEnd uint64, resultCh chan *MiningResult)
+
+// VerifyPoW verifies a computed PoW solution
+func (e *Engine) VerifyPoW(headerHash []byte, seed []byte,
+    nonce uint64, difficulty uint64) bool
 ```
 
 #### Miner
 
 ```go
-// Start mining
+// Start begins mining operations
 func (m *Miner) Start(ctx context.Context) error
 
-// Stop mining
+// Stop gracefully stops mining
 func (m *Miner) Stop() error
 
-// Get statistics
+// GetStats returns current mining statistics
 func (m *Miner) GetStats() *MinerStats
+
+// GetHashRate returns real-time hashrate
+func (m *Miner) GetHashRate() uint64
+```
+
+#### Pool Manager
+
+```go
+// Start launches the pool manager and health check loop
+func (m *Manager) Start(ctx context.Context) error
+
+// Stop shuts down the pool manager
+func (m *Manager) Stop()
+
+// GetClient returns the Stratum client for the current pool
+func (m *Manager) GetClient() *stratum.Client
+
+// RecordShare records a share submission result
+func (m *Manager) RecordShare(accepted bool)
+
+// UpdateHashRate updates the current pool hash rate
+func (m *Manager) UpdateHashRate(hashRate uint64)
 ```
 
 ---
@@ -1105,7 +1129,7 @@ See [LICENSE](LICENSE) for details.
 ---
 
 **Version**: v1.0.0  
-**Last Updated**: 2026-05-19  
+**Last Updated**: 2026-06-09  
 **Maintained By**: NogoChain Development Team
 
 ---

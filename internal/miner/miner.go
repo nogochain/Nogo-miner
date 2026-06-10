@@ -41,6 +41,7 @@ type Miner struct {
 	jobMu         sync.RWMutex
 	submittedWork uint64
 	acceptedWork  uint64
+	startTime     time.Time // Mining start time, used for hashrate calculation
 
 	// Hash report for pool-based reward tracking
 	lastReportedHashes uint64
@@ -109,6 +110,7 @@ func (m *Miner) Start() error {
 		return fmt.Errorf("miner already running")
 	}
 
+	m.startTime = time.Now() // Record mining start time for hashrate calculation
 	m.log.Infof("Starting miner with %d threads", len(m.workers))
 
 	// Start pool manager
@@ -529,13 +531,24 @@ func (m *Miner) Stop() error {
 	return nil
 }
 
-// GetHashRate returns total hash rate
+// GetHashRate returns total hash rate across all workers.
+// Uses TotalHashes (cross-session cumulative) and startTime for accurate rate.
+// FIXED: Previously used engine.GetHashRate() which resets per Mine() call, always returning 0.
 func (m *Miner) GetHashRate() uint64 {
-	var total uint64 = 0
-	for _, worker := range m.workers {
-		total += worker.engine.GetHashRate()
+	m.mu.RLock()
+	startTime := m.startTime
+	m.mu.RUnlock()
+
+	elapsed := time.Since(startTime).Seconds()
+	if elapsed <= 0 {
+		return 0
 	}
-	return total
+
+	var totalHashes uint64 = 0
+	for _, worker := range m.workers {
+		totalHashes += atomic.LoadUint64(&worker.hashCount)
+	}
+	return uint64(float64(totalHashes) / elapsed)
 }
 
 // GetStats returns miner statistics
@@ -545,8 +558,27 @@ func (m *Miner) GetStats() *MinerStats {
 		totalHashes += atomic.LoadUint64(&worker.hashCount)
 	}
 
+	// Sync totalHashes to monitor for real-time hashrate display
+	if m.monitor != nil {
+		m.monitor.AddHashes(totalHashes) // additive, ok since monitor resets on Start()
+	}
+
+	// Calculate hashrate directly (avoid recursion from GetHashRate → GetStats loop)
+	m.mu.RLock()
+	startTime := m.startTime
+	m.mu.RUnlock()
+	hashRate := uint64(0)
+	if elapsed := time.Since(startTime).Seconds(); elapsed > 0 {
+		hashRate = uint64(float64(totalHashes) / elapsed)
+	}
+
+	// Also update monitor's real-time hashrate
+	if m.monitor != nil {
+		m.monitor.UpdateHashRate(hashRate)
+	}
+
 	return &MinerStats{
-		HashRate:      m.GetHashRate(),
+		HashRate:      hashRate,
 		TotalHashes:   totalHashes,
 		SubmittedWork: atomic.LoadUint64(&m.submittedWork),
 		AcceptedWork:  atomic.LoadUint64(&m.acceptedWork),

@@ -119,9 +119,18 @@ func (m *Monitor) updateStats() {
 	// Update uptime
 	m.stats.Uptime = time.Since(m.stats.StartTime)
 
-	// Calculate average hash rate
 	elapsed := m.stats.Uptime.Seconds()
-	if elapsed > 0 && m.stats.TotalHashes > 0 {
+	if elapsed <= 0 {
+		return
+	}
+
+	// Calculate real-time hash rate (based on total hashes since start)
+	if m.stats.TotalHashes > 0 {
+		m.stats.HashRate = uint64(float64(m.stats.TotalHashes) / elapsed)
+	}
+
+	// Calculate average hash rate (same as real-time for cumulative calculation)
+	if m.stats.TotalHashes > 0 {
 		m.stats.AvgHashRate = uint64(float64(m.stats.TotalHashes) / elapsed)
 	}
 

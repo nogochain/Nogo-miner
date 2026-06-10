@@ -193,6 +193,14 @@ func (m *Manager) checkPoolHealth(ctx context.Context) {
 	currentPool := m.pools[m.currentPool]
 	m.mu.RUnlock()
 
+	// Let readLoop handle reconnection — it is either actively dialing
+	// (IsReconnecting) or in backoff (IsAlive but !IsConnected).
+	// Interrupting would cause an unnecessary Close→Connect cycle.
+	if currentPool.client.IsReconnecting() || currentPool.client.IsAlive() {
+		m.log.Debugf("Client is managing reconnection, skipping health check intervention")
+		return
+	}
+
 	// Check if still connected
 	if !currentPool.client.IsConnected() {
 		m.log.Warnf("Current pool %s disconnected", currentPool.config.Name)

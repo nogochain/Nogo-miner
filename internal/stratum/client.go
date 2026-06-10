@@ -19,11 +19,12 @@ import (
 
 // Reconnection backoff parameters
 const (
-	initialReconnectDelay = 1 * time.Second
-	maxReconnectDelay     = 30 * time.Second
-	readDeadlineDuration  = 90 * time.Second // Read deadline for silent disconnection detection
-	writeDeadlineDuration = 2 * time.Second  // Short: broken writes fail fast, don't waste Worker time
-	maxWriteFails         = 2                // Consecutive write failures before forcing reconnect
+	initialReconnectDelay = 2 * time.Second
+	maxReconnectDelay     = 60 * time.Second
+	readDeadlineDuration  = 120 * time.Second // Read deadline for silent disconnection detection
+	writeDeadlineDuration = 5 * time.Second   // Short: broken writes fail fast, don't waste Worker time
+	maxWriteFails         = 3                 // Consecutive write failures before forcing reconnect
+	minConnectionLifetime = 10 * time.Second  // If connection lasts < this, treat as failed reconnect
 )
 
 // Client represents a Stratum client for pool communication
@@ -54,6 +55,11 @@ type Client struct {
 	// This prevents the read loop from reconnecting when the pool is deliberately
 	// switched away (pool manager switchToNextPool).
 	stopCh chan struct{}
+
+	// readLoopDone is closed when readLoop truly exits. Close() waits on this
+	// channel before resetting readLoopStarted to prevent spawning duplicate
+	// readLoop goroutines (the root cause of WebSocket frame corruption).
+	readLoopDone chan struct{}
 }
 
 // MiningJob represents a mining job from pool
@@ -99,13 +105,14 @@ func NewClient(poolURL, minerAddr string, log Logger) *Client {
 	}
 
 	return &Client{
-		poolURL:     poolURL,
-		minerAddr:   minerAddr,
-		log:         log,
-		jobCh:       make(chan *MiningJob, 10),
-		resultCh:    make(chan *SubmitResult, 10),
-		loginRespCh: make(chan bool, 1),
-		stopCh:      make(chan struct{}),
+		poolURL:      poolURL,
+		minerAddr:    minerAddr,
+		log:          log,
+		jobCh:        make(chan *MiningJob, 10),
+		resultCh:     make(chan *SubmitResult, 10),
+		loginRespCh:  make(chan bool, 1),
+		stopCh:       make(chan struct{}),
+		readLoopDone: make(chan struct{}),
 	}
 }
 
@@ -404,9 +411,27 @@ func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) er
 // When Close() is called (e.g., pool switch), stopCh is closed and
 // the loop exits permanently.
 func (c *Client) readLoop(ctx context.Context) {
+	// CRITICAL: When readLoop exits (for any reason), clean up the connection
+	// and signal Close() that it's safe to reset readLoopStarted. Without this
+	// defer, Close() would reset readLoopStarted while readLoop is still alive,
+	// allowing Connect() to spawn a duplicate readLoop goroutine that reads from
+	// the same WebSocket → frame corruption → disconnection spiral.
+	defer func() {
+		c.mu.Lock()
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
+		}
+		c.connected = false
+		c.mu.Unlock()
+		close(c.readLoopDone)
+		c.log.Debugf("readLoop: terminated")
+	}()
+
 	c.log.Debugf("readLoop started (persistent, with auto-reconnection)")
 
 	backoff := initialReconnectDelay
+	connStartTime := time.Now() // Track when current connection was established
 
 	for {
 		// Check if context is cancelled
@@ -456,6 +481,7 @@ func (c *Client) readLoop(ctx context.Context) {
 			}
 
 			c.log.Infof("readLoop: reconnected successfully")
+			connStartTime = time.Now()
 			backoff = initialReconnectDelay // Reset backoff on success
 			continue
 		}
@@ -473,12 +499,14 @@ func (c *Client) readLoop(ctx context.Context) {
 		}
 
 		_, message, err := conn.ReadMessage()
-		
+
 		// STOP pingLoop before processing read error or continuing to next iteration
 		pingCancel()
-		
+
 		if err != nil {
-			c.log.Errorf("readLoop: read error: %v", err)
+			connLifetime := time.Since(connStartTime)
+			c.log.Errorf("readLoop: read error after %v: %v", connLifetime.Round(time.Second), err)
+
 			c.mu.Lock()
 			c.connected = false
 			if c.conn != nil {
@@ -486,15 +514,35 @@ func (c *Client) readLoop(ctx context.Context) {
 				c.conn = nil
 			}
 			c.mu.Unlock()
+
+			// If connection died very quickly (< minConnectionLifetime), this is a
+			// rapid reconnect cycle — increase backoff to break the spin loop.
+			if connLifetime < minConnectionLifetime && backoff < maxReconnectDelay {
+				backoff *= 2
+				if backoff > maxReconnectDelay {
+					backoff = maxReconnectDelay
+				}
+				c.log.Warnf("readLoop: connection died quickly (%v), increasing backoff to %v",
+					connLifetime.Round(time.Second), backoff)
+			}
 			// Loop back - will reconnect on next iteration with backoff
 			continue
 		}
 
+		// Reset backoff on successful read (connection is healthy)
+		if backoff > initialReconnectDelay {
+			backoff = initialReconnectDelay
+			c.log.Debugf("readLoop: connection healthy, reset backoff to %v", backoff)
+		}
+
+		// Successful read — reset connection timer for lifetime tracking
+		connStartTime = time.Now()
+
 		if len(message) > 120 {
-		c.log.Debugf("Recv: %s...", string(message[:120]))
-	} else {
-		c.log.Debugf("Recv: %s", string(message))
-	}
+			c.log.Debugf("Recv: %s...", string(message[:120]))
+		} else {
+			c.log.Debugf("Recv: %s", string(message))
+		}
 		c.handleMessage(ctx, message)
 	}
 }
@@ -509,8 +557,7 @@ func (c *Client) pingLoop(conn *websocket.Conn, ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// FIXED: Context cancellation stops this goroutine
-			log.Printf("pingLoop: context cancelled, stopping")
+			// Normal: readLoop cancels this when ReadMessage returns (every message read)
 			return
 		case <-ticker.C:
 			if conn == nil {
@@ -523,8 +570,7 @@ func (c *Client) pingLoop(conn *websocket.Conn, ctx context.Context) {
 			err := conn.WriteMessage(websocket.PingMessage, nil)
 			c.sendMu.Unlock()
 			if err != nil {
-				// Don't close on single ping failure — sendRequest's 2-fail counter
-				// is the sole authority for connection health decisions.
+				c.log.Debugf("pingLoop: ping write failed: %v (connection likely dead)", err)
 				return
 			}
 		}
@@ -718,6 +764,31 @@ func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
 	return c.sendRequest(ctx, req)
 }
 
+// IsReconnecting returns true if a dialAndLogin is currently in progress.
+// Health check uses this to avoid calling switchToNextPool while readLoop
+// is already handling reconnection — Close()+Connect() during dialAndLogin
+// would spawn duplicate readLoop goroutines (the root cause of disconnection).
+func (c *Client) IsReconnecting() bool {
+	return atomic.LoadInt32(&c.dialing) == 1
+}
+
+// IsAlive returns true if the readLoop goroutine is running and can handle
+// reconnection autonomously. External code (e.g. healthCheckLoop) MUST check
+// this before calling Close()+Connect() to avoid interrupting a healthy recovery.
+func (c *Client) IsAlive() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.readLoopStarted {
+		return false
+	}
+	select {
+	case <-c.stopCh:
+		return false
+	default:
+		return true
+	}
+}
+
 // IsConnected returns connection status
 func (c *Client) IsConnected() bool {
 	c.mu.RLock()
@@ -729,11 +800,15 @@ func (c *Client) IsConnected() bool {
 // After Close, the client can be reused by calling Connect() again.
 // readLoopStarted and stopCh are reset so that a subsequent Connect() call
 // can start a fresh read loop (needed for pool switching).
+//
+// CRITICAL: Close() waits for readLoop to confirm exit via readLoopDone before
+// resetting readLoopStarted. This prevents the race where Connect() starts a
+// second readLoop while the old one is still alive, causing multiple goroutines
+// to read from the same WebSocket → frame corruption → disconnection spiral.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
-	// Close stopCh to signal readLoop to exit
+	// 1. Signal readLoop to stop
 	select {
 	case <-c.stopCh:
 		// Already closed
@@ -741,7 +816,7 @@ func (c *Client) Close() error {
 		close(c.stopCh)
 	}
 
-	// Close the current WebSocket connection
+	// 2. Close active connection to break any blocking I/O in readLoop/dialAndLogin
 	if c.conn != nil {
 		if err := c.conn.Close(); err != nil {
 			c.log.Debugf("Close: connection close error: %v", err)
@@ -750,11 +825,26 @@ func (c *Client) Close() error {
 	}
 	c.connected = false
 
-	// Reset internal state so this Client can be reused by a subsequent Connect() call.
-	// Without this, Connect() would see readLoopStarted=true and return nil immediately,
-	// preventing reconnection after pool switch.
+	// 3. Capture state under lock, then RELEASE lock before waiting.
+	// Must not hold c.mu during the wait because readLoop acquires
+	// c.mu.RLock() in its loop and c.mu.Lock() in its defer cleanup.
+	wasStarted := c.readLoopStarted
+	done := c.readLoopDone
+	c.mu.Unlock()
+
+	// 4. Wait for readLoop to confirm exit (only if it was ever started).
+	// If readLoop was never started (Connect never called), skip the wait
+	// to avoid blocking forever on an open channel.
+	if wasStarted {
+		<-done
+	}
+
+	// 5. Now safe to reset state — readLoop is truly dead.
+	c.mu.Lock()
 	c.readLoopStarted = false
 	c.stopCh = make(chan struct{})
+	c.readLoopDone = make(chan struct{})
+	c.mu.Unlock()
 
 	return nil
 }
