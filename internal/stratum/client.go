@@ -1,20 +1,19 @@
-// Package stratum provides WebSocket Stratum client for mining pool communication
+// Package stratum provides TCP Stratum client for mining pool communication
 package stratum
 
 import (
+	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/big"
 	"net"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 // Reconnection backoff parameters
@@ -25,40 +24,46 @@ const (
 	writeDeadlineDuration = 5 * time.Second   // Short: broken writes fail fast, don't waste Worker time
 	maxWriteFails         = 3                 // Consecutive write failures before forcing reconnect
 	minConnectionLifetime = 10 * time.Second  // If connection lasts < this, treat as failed reconnect
+	subscribeTimeout      = 10 * time.Second  // Timeout for mining.subscribe response
+	authorizeTimeout      = 10 * time.Second  // Timeout for mining.authorize response
 )
 
-// Client represents a Stratum client for pool communication
+// Client represents a Stratum TCP client for pool communication
 type Client struct {
 	mu          sync.RWMutex
-	sendMu      sync.Mutex // Protects WebSocket write operations (gorilla/websocket forbids concurrent write)
-	conn        *websocket.Conn
+	sendMu      sync.Mutex // Protects TCP write operations from concurrent goroutines
+	conn        net.Conn
+	bufReader   *bufio.Reader
 	poolURL     string
+	poolHost    string
+	poolPort    string
 	minerAddr   string
+	workerName  string
+	password    string
 	writeFails  int32 // atomic: consecutive write failures
 	log         Logger
 	connected   bool
 	jobCh       chan *MiningJob
 	resultCh    chan *SubmitResult
 	lastJob     *MiningJob
-	subscribeID string
-	loginRespCh chan bool // Channel to wait for login response
 
-	// dialing prevents concurrent dialAndLogin calls (gorilla/websocket forbids concurrent read)
+	// Stratum protocol state
+	subscribeID     string
+	extraNonce1     string
+	extraNonce2Size int
+	nextRequestID   uint64 // atomic: incrementing JSON-RPC request ID
+
+	// dialing prevents concurrent dialAndHandshake calls
 	dialing     int32     // atomic flag: 1 = dialing in progress
-	dialDone    chan struct{} // signaled when dialAndLogin completes
+	dialDone    chan struct{} // signaled when dialAndHandshake completes
 
-	// readLoopOnce ensures the read loop goroutine is started exactly once.
-	// After initial Connect, the read loop handles all reconnection internally.
+	// readLoopStarted ensures the read loop goroutine is started exactly once.
 	readLoopStarted bool
 
 	// stopCh is closed when Close() is called to permanently stop the read loop.
-	// This prevents the read loop from reconnecting when the pool is deliberately
-	// switched away (pool manager switchToNextPool).
 	stopCh chan struct{}
 
-	// readLoopDone is closed when readLoop truly exits. Close() waits on this
-	// channel before resetting readLoopStarted to prevent spawning duplicate
-	// readLoop goroutines (the root cause of WebSocket frame corruption).
+	// readLoopDone is closed when readLoop truly exits.
 	readLoopDone chan struct{}
 }
 
@@ -68,8 +73,8 @@ type MiningJob struct {
 	Height       uint64   `json:"height"`
 	PrevHash     string   `json:"prevHash"`
 	MerkleRoot   string   `json:"merkleRoot"`
-	StateRoot    string   `json:"stateRoot"` // World State MPT root hash (required for PoW)
-	Difficulty   *big.Int `json:"difficulty"` // Changed to *big.Int
+	StateRoot    string   `json:"stateRoot"`
+	Difficulty   *big.Int `json:"difficulty"`
 	ExtraNonce   string   `json:"extraNonce"`
 	Timestamp    int64    `json:"timestamp"`
 	MinerAddress string   `json:"minerAddress"`
@@ -98,33 +103,73 @@ func (l *simpleLogger) Debugf(format string, args ...interface{}) { fmt.Printf(f
 func (l *simpleLogger) Warnf(format string, args ...interface{})  { fmt.Printf(format+"\n", args...) }
 func (l *simpleLogger) Errorf(format string, args ...interface{}) { fmt.Printf(format+"\n", args...) }
 
-// NewClient creates a new Stratum client
+// Stratum JSON message types
+type stratumRequest struct {
+	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+type stratumResponse struct {
+	ID     json.RawMessage `json:"id"`
+	Result interface{}     `json:"result"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type stratumNotification struct {
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+// NewClient creates a new Stratum TCP client
 func NewClient(poolURL, minerAddr string, log Logger) *Client {
 	if log == nil {
 		log = &simpleLogger{}
 	}
 
+	// Parse pool URL to extract host and port
+	poolHost := poolURL
+	poolPort := "8008" // Default Stratum port
+
+	// Handle ws://host:port or tcp://host:port or stratum+tcp://host:port or host:port formats
+	rawURL := poolURL
+	rawURL = strings.TrimPrefix(rawURL, "ws://")
+	rawURL = strings.TrimPrefix(rawURL, "tcp://")
+	rawURL = strings.TrimPrefix(rawURL, "stratum+tcp://")
+
+	if parts := strings.SplitN(rawURL, ":", 2); len(parts) == 2 {
+		poolHost = parts[0]
+		poolPort = parts[1]
+		if idx := strings.Index(poolPort, "/"); idx >= 0 {
+			poolPort = poolPort[:idx]
+		}
+	}
+
 	return &Client{
 		poolURL:      poolURL,
+		poolHost:     poolHost,
+		poolPort:     poolPort,
 		minerAddr:    minerAddr,
+		workerName:   minerAddr,
+		password:     "x",
 		log:          log,
 		jobCh:        make(chan *MiningJob, 10),
 		resultCh:     make(chan *SubmitResult, 10),
-		loginRespCh:  make(chan bool, 1),
 		stopCh:       make(chan struct{}),
 		readLoopDone: make(chan struct{}),
 	}
 }
 
-// Connect establishes WebSocket connection to pool.
+// Connect establishes TCP connection to pool and performs Stratum handshake.
 // On the first call, it also starts the persistent read loop that handles
 // auto-reconnection when the connection drops. Subsequent calls are no-ops
 // if the read loop is already running.
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	if c.readLoopStarted {
-		// Read loop already running and handles reconnection internally.
-		// If currently disconnected, the read loop will reconnect automatically.
 		c.mu.Unlock()
 		c.log.Debugf("Connect called but read loop already running, skipping")
 		return nil
@@ -132,295 +177,238 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.readLoopStarted = true
 	c.mu.Unlock()
 
-	c.log.Infof("Connecting to pool: %s", c.poolURL)
+	c.log.Infof("Connecting to pool: %s:%s", c.poolHost, c.poolPort)
+	log.Printf("[NOGOMINER] Attempting TCP connection to pool: %s:%s", c.poolHost, c.poolPort)
 
-	// Initial connection — dialAndLogin reads WebSocket directly until loginSuccess,
-	// because readLoop hasn't started yet.
-	log.Printf("[NOGOMINER] Attempting connection to pool: %s", c.poolURL)
-	if err := c.dialAndLogin(ctx); err != nil {
+	if err := c.dialAndHandshake(ctx); err != nil {
 		c.log.Errorf("Initial connection failed: %v", err)
 		log.Printf("[NOGOMINER] ❌ Connection FAILED: %v", err)
 		return err
 	}
 
-	log.Printf("[NOGOMINER] ✅ Connection and login SUCCESSFUL!")
+	log.Printf("[NOGOMINER] ✅ Connection and handshake SUCCESSFUL!")
 
-	// Start the persistent read loop that handles auto-reconnection.
-	// This single goroutine lives for the entire client lifetime.
-	// IMPORTANT: Use context.Background() instead of the caller's ctx,
-	// because the ctx passed to Connect() is typically a timeout context
-	// created by connectToPool (e.g. 10s), which gets cancelled immediately
-	// after Connect returns. readLoop must survive for the entire client lifetime.
 	go c.readLoop(context.Background())
 
 	return nil
 }
 
-// dialAndLogin dials WebSocket and performs login (used for both initial connect and reconnection).
-// CRITICAL: This function reads WebSocket messages directly until loginSuccess is received,
-// because the readLoop hasn't started yet (initial connect) or is blocked waiting for this
-// function to return (reconnection). Without direct reading, no one processes the WebSocket
-// response and login would always time out.
-//
-// IMPORTANT: This function does NOT set c.conn until AFTER loginSuccess is confirmed.
-// It uses a local newConn variable throughout the login handshake. This prevents a
-// race condition where readLoop picks up the connection mid-login and calls ReadMessage,
-// causing a gorilla/websocket panic ("repeated read on failed websocket connection").
-func (c *Client) dialAndLogin(ctx context.Context) error {
-	// Prevent concurrent dialAndLogin calls (gorilla/websocket forbids concurrent read).
-	// If another goroutine is already dialing, wait for it to complete, then check result.
+// dialAndHandshake dials TCP and performs Stratum subscribe + authorize.
+// Used for both initial connect and reconnection.
+// IMPORTANT: This function does NOT set c.conn until AFTER handshake is confirmed.
+// It uses a local newConn variable throughout the handshake. This prevents a
+// race condition where readLoop picks up the connection mid-handshake.
+func (c *Client) dialAndHandshake(ctx context.Context) error {
 	if !atomic.CompareAndSwapInt32(&c.dialing, 0, 1) {
-		// Already dialing — wait for completion, then check if connection succeeded
-		c.log.Debugf("dialAndLogin: already dialing, waiting for completion")
+		c.log.Debugf("dialAndHandshake: already dialing, waiting for completion")
 		<-c.dialDone
-		// After waiting, check if connection is now established
 		c.mu.RLock()
 		conn := c.conn
 		connected := c.connected
 		c.mu.RUnlock()
 		if conn != nil && connected {
-			c.log.Debugf("dialAndLogin: waited for existing dial, connection successful")
-			return nil // Connection succeeded, return nil
+			return nil
 		}
-		// Existing dial failed, return error to let caller retry
 		return fmt.Errorf("previous dial failed, please retry")
 	}
-	// Create fresh dialDone channel for this dial attempt
 	c.dialDone = make(chan struct{})
-	// Defer: reset dialing flag and close dialDone to signal waiters
 	defer func() {
 		atomic.StoreInt32(&c.dialing, 0)
 		close(c.dialDone)
 	}()
 
-	// Parse poolURL to get host
-	parsedURL, err := url.Parse(c.poolURL)
+	// Resolve TCP address
+	tcpAddr, err := net.ResolveTCPAddr("tcp", c.poolHost+":"+c.poolPort)
 	if err != nil {
-		return fmt.Errorf("parse pool URL: %w", err)
+		return fmt.Errorf("resolve address: %w", err)
 	}
 
-	poolHost := parsedURL.Host
-	if poolHost == "" {
-		poolHost = strings.TrimPrefix(parsedURL.Path, "//")
-		if idx := strings.Index(poolHost, "/"); idx != -1 {
-			poolHost = poolHost[:idx]
+	// Dial with timeout
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	newConn, err := dialer.DialContext(ctx, "tcp", tcpAddr.String())
+	if err != nil {
+		return fmt.Errorf("dial tcp: %w", err)
+	}
+
+	// Enable TCP keepalive to detect dead connections faster
+	if tcpConn, ok := newConn.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			c.log.Debugf("setKeepAlive: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			c.log.Debugf("setKeepAlivePeriod: %v", err)
 		}
 	}
 
-	// Test TCP connectivity first
-	tcpConn, err := net.DialTimeout("tcp", poolHost, 5*time.Second)
+	// Set initial read deadline
+	if err := newConn.SetReadDeadline(time.Now().Add(readDeadlineDuration)); err != nil {
+		c.log.Debugf("setReadDeadline: %v", err)
+	}
+
+	// Create buffered reader for line-based reading
+	bufReader := bufio.NewReader(newConn)
+
+	// Step 1: mining.subscribe
+	subID := atomic.AddUint64(&c.nextRequestID, 1)
+	subscribeReq := map[string]interface{}{
+		"id":     subID,
+		"method": "mining.subscribe",
+		"params": []string{"Nogominer/1.0.0"},
+	}
+
+	subscribeData, err := json.Marshal(subscribeReq)
 	if err != nil {
-		return fmt.Errorf("tcp connect: %w", err)
-	}
-	tcpConn.Close()
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-		Proxy:            nil,
+		newConn.Close()
+		return fmt.Errorf("marshal subscribe: %w", err)
 	}
 
-	newConn, _, err := dialer.Dial(c.poolURL, nil)
+	if err := newConn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration)); err != nil {
+		c.log.Debugf("setWriteDeadline subscribe: %v", err)
+	}
+	if _, err := newConn.Write(append(subscribeData, '\n')); err != nil {
+		newConn.Close()
+		return fmt.Errorf("send subscribe: %w", err)
+	}
+	if err := newConn.SetWriteDeadline(time.Time{}); err != nil {
+		c.log.Debugf("clear write deadline: %v", err)
+	}
+
+	c.log.Debugf("mining.subscribe sent (id=%d)", subID)
+
+	// Read subscribe response
+	subscribeResp, err := c.readLineWithTimeout(bufReader, subscribeTimeout)
 	if err != nil {
-		return fmt.Errorf("dial pool: %w", err)
+		newConn.Close()
+		return fmt.Errorf("read subscribe response: %w", err)
 	}
 
-	// FIX: Set pong handler to refresh read deadline and keep connection alive.
-	// Without this, the read deadline (90s) will expire even if the connection is healthy,
-	// causing unnecessary disconnections. The pong handler is called automatically
-	// when the pool responds to our ping with a pong.
-	newConn.SetReadDeadline(time.Now().Add(readDeadlineDuration))
-	newConn.SetPongHandler(func(string) error {
-		newConn.SetReadDeadline(time.Now().Add(readDeadlineDuration))
-		c.log.Debugf("Pong received, read deadline refreshed")
-		return nil
-	})
+	var subResp stratumResponse
+	if err := json.Unmarshal([]byte(subscribeResp), &subResp); err != nil {
+		newConn.Close()
+		return fmt.Errorf("parse subscribe response: %w", err)
+	}
 
-	// CRITICAL: Do NOT store newConn in c.conn yet. If readLoop picks it up before
-	// login completes, it will start reading from it, triggering the gorilla/websocket
-	// panic "repeated read on failed websocket connection".
-	// c.conn is only set after loginSuccess is confirmed below.
+	if subResp.Error != nil {
+		newConn.Close()
+		return fmt.Errorf("subscribe rejected: code=%d msg=%s", subResp.Error.Code, subResp.Error.Message)
+	}
 
-	// Drain login response channel to remove stale values
+	// Parse subscribe result:
+	// [ [ ["mining.notify", "subscription_id"], ...], extraNonce1, extraNonce2Size ]
+	if resultArr, ok := subResp.Result.([]interface{}); ok && len(resultArr) >= 3 {
+		c.extraNonce1, _ = resultArr[1].(string)
+		if extraNonce2Size, ok := resultArr[2].(float64); ok {
+			c.extraNonce2Size = int(extraNonce2Size)
+		}
+		// Extract subscribeID from the first element
+		if firstArr, ok := resultArr[0].([]interface{}); ok && len(firstArr) > 0 {
+			if subArr, ok := firstArr[0].([]interface{}); ok && len(subArr) >= 2 {
+				c.subscribeID, _ = subArr[1].(string)
+			}
+		}
+	}
+
+	c.log.Infof("Subscribed: extraNonce1=%s, extraNonce2Size=%d", c.extraNonce1, c.extraNonce2Size)
+
+	// Step 2: mining.authorize
+	authID := atomic.AddUint64(&c.nextRequestID, 1)
+	authorizeReq := map[string]interface{}{
+		"id":     authID,
+		"method": "mining.authorize",
+		"params": []string{c.minerAddr, c.password},
+	}
+
+	authorizeData, err := json.Marshal(authorizeReq)
+	if err != nil {
+		newConn.Close()
+		return fmt.Errorf("marshal authorize: %w", err)
+	}
+
+	if err := newConn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration)); err != nil {
+		c.log.Debugf("setWriteDeadline authorize: %v", err)
+	}
+	if _, err := newConn.Write(append(authorizeData, '\n')); err != nil {
+		newConn.Close()
+		return fmt.Errorf("send authorize: %w", err)
+	}
+	if err := newConn.SetWriteDeadline(time.Time{}); err != nil {
+		c.log.Debugf("clear write deadline: %v", err)
+	}
+
+	c.log.Debugf("mining.authorize sent (id=%d, worker=%s)", authID, c.minerAddr)
+
+	// Read authorize response
+	authResp, err := c.readLineWithTimeout(bufReader, authorizeTimeout)
+	if err != nil {
+		newConn.Close()
+		return fmt.Errorf("read authorize response: %w", err)
+	}
+
+	var authResult stratumResponse
+	if err := json.Unmarshal([]byte(authResp), &authResult); err != nil {
+		newConn.Close()
+		return fmt.Errorf("parse authorize response: %w", err)
+	}
+
+	if authResult.Error != nil {
+		newConn.Close()
+		return fmt.Errorf("authorize rejected: code=%d msg=%s", authResult.Error.Code, authResult.Error.Message)
+	}
+
+	// Check if result is boolean true
+	if authorized, ok := authResult.Result.(bool); ok && !authorized {
+		newConn.Close()
+		return fmt.Errorf("authorize failed: pool returned false")
+	}
+
+	c.log.Infof("Authorized: %s", c.minerAddr)
+
+	// Handshake complete — store connection atomically
+	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.conn = newConn
+	c.bufReader = bufReader
+	c.connected = true
+	c.mu.Unlock()
+
+	return nil
+}
+
+// readLineWithTimeout reads a newline-delimited line with a specific timeout.
+func (c *Client) readLineWithTimeout(reader *bufio.Reader, timeout time.Duration) (string, error) {
+	type lineResult struct {
+		line string
+		err  error
+	}
+
+	resultCh := make(chan lineResult, 1)
+	go func() {
+		line, err := reader.ReadString('\n')
+		resultCh <- lineResult{line, err}
+	}()
+
 	select {
-	case <-c.loginRespCh:
-	default:
+	case res := <-resultCh:
+		return strings.TrimSpace(res.line), res.err
+	case <-time.After(timeout):
+		return "", fmt.Errorf("read timeout after %v", timeout)
 	}
-
-	// Send login directly on newConn (NOT via sendRequest which uses c.conn).
-	// This avoids exposing newConn to the concurrent readLoop goroutine.
-	loginReq := map[string]interface{}{
-		"method": "login",
-		"params": map[string]string{
-			"address": c.minerAddr,
-		},
-	}
-	loginData, err := json.Marshal(loginReq)
-	if err != nil {
-		newConn.Close()
-		return fmt.Errorf("marshal login: %w", err)
-	}
-	if err := newConn.WriteMessage(websocket.TextMessage, loginData); err != nil {
-		newConn.Close()
-		return fmt.Errorf("send login: %w", err)
-	}
-	c.log.Debugf("Login request sent (direct write)")
-
-	// CRITICAL: Read WebSocket messages directly until loginSuccess is confirmed.
-	// The readLoop is not running (initial connect) or the loop iteration
-	// that called us will continue (reconnection), so we must process messages
-	// here to avoid login timeout.
-	c.log.Debugf("dialAndLogin: waiting for login response (reading WebSocket directly)...")
-	loginDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(loginDeadline) {
-		if err := newConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-			c.log.Debugf("dialAndLogin: setReadDeadline error: %v", err)
-		}
-
-		_, message, err := newConn.ReadMessage()
-		if err != nil {
-			// Any error (including timeout) — close and let readLoop retry with backoff.
-			// Retrying ReadMessage on the same conn after ANY error causes
-			// gorilla/websocket to panic with "repeated read on failed websocket connection".
-			newConn.Close()
-			return fmt.Errorf("read login response: %w", err)
-		}
-
-		// Process the message
-		var msg map[string]interface{}
-		if err := json.Unmarshal(message, &msg); err != nil {
-			c.log.Debugf("dialAndLogin: unmarshal error: %v", err)
-			continue
-		}
-
-		method, _ := msg["method"].(string)
-		switch method {
-		case "loginSuccess":
-			// Login confirmed — NOW store the connection in c.conn.
-			// Replacing the old connection under lock ensures readLoop
-			// picks up the confirmed connection atomically.
-			c.mu.Lock()
-			if c.conn != nil {
-				c.conn.Close()
-			}
-			c.conn = newConn
-			c.connected = true
-			c.mu.Unlock()
-			// Notify login response channel (for any concurrent waiters)
-			select {
-			case c.loginRespCh <- true:
-			default:
-			}
-			c.log.Infof("Login confirmed (direct read)")
-			return nil
-
-		case "welcome":
-			c.log.Infof("Received welcome from pool (direct read)")
-
-		case "error":
-			if params, ok := msg["params"].(map[string]interface{}); ok {
-				if errMsg, ok := params["message"].(string); ok {
-					c.log.Errorf("Pool login error: %s", errMsg)
-				}
-			}
-			newConn.Close()
-			return fmt.Errorf("login rejected by pool")
-		}
-	}
-
-	// Login deadline expired
-	newConn.Close()
-	return fmt.Errorf("login timeout: no login response within 10s")
-}
-
-// login sends login request to pool
-func (c *Client) login(ctx context.Context) error {
-	req := map[string]interface{}{
-		"method": "login",
-		"params": map[string]string{
-			"address": c.minerAddr,
-		},
-	}
-
-	c.log.Debugf("Sending login (addr: %s...)", c.minerAddr[:min(16, len(c.minerAddr))])
-
-	if err := c.sendRequest(ctx, req); err != nil {
-		c.log.Errorf("Failed to send login request: %v", err)
-		return err
-	}
-
-	c.log.Infof("Logged in with address: %s", c.minerAddr)
-	return nil
-}
-
-// sendRequest sends a JSON-RPC request
-func (c *Client) sendRequest(ctx context.Context, req map[string]interface{}) error {
-	c.log.Infof(">>> sendRequest called")
-
-	data, err := json.Marshal(req)
-	if err != nil {
-		c.log.Errorf("Marshal error: %v", err)
-		return err
-	}
-
-	c.mu.RLock()
-	conn := c.conn
-	c.mu.RUnlock()
-
-	if conn == nil {
-		c.log.Errorf("Connection is nil (sendRequest blocked)")
-		return fmt.Errorf("not connected")
-	}
-
-	if len(data) > 120 {
-		c.log.Debugf("Send: %s...", string(data[:120]))
-	} else {
-		c.log.Debugf("Send: %s", string(data))
-	}
-
-	// Use sendMu to prevent concurrent write to WebSocket (gorilla/websocket forbids concurrent write)
-	// This also protects against concurrent writes from pingLoop
-	c.sendMu.Lock()
-	conn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration))
-	err = conn.WriteMessage(websocket.TextMessage, data)
-	c.sendMu.Unlock()
-
-	if err != nil {
-		c.log.Errorf("WriteMessage error: %v", err)
-		fails := atomic.AddInt32(&c.writeFails, 1)
-		// Only close after consecutive failures. A single transient error (e.g., brief
-		// network hiccup) should not trigger a full reconnect cycle that loses all in-flight shares.
-		// After maxWriteFails consecutive failures, the connection is truly broken.
-		if int(fails) >= maxWriteFails {
-			conn.Close()
-			atomic.StoreInt32(&c.writeFails, 0)
-			c.log.Warnf("Connection closed after %d consecutive write failures", maxWriteFails)
-		}
-		return err
-	}
-	// Successful write resets the failure counter
-	atomic.StoreInt32(&c.writeFails, 0)
-	c.log.Infof(">>> Message sent successfully")
-
-	return nil
 }
 
 // readLoop is the persistent read loop with auto-reconnection.
 // It runs in a single goroutine for the entire client lifetime.
-// When the WebSocket connection drops, it automatically reconnects
+// When the TCP connection drops, it automatically reconnects
 // with exponential backoff and resumes reading messages.
-// When Close() is called (e.g., pool switch), stopCh is closed and
-// the loop exits permanently.
+// When Close() is called, stopCh is closed and the loop exits permanently.
 func (c *Client) readLoop(ctx context.Context) {
-	// CRITICAL: When readLoop exits (for any reason), clean up the connection
-	// and signal Close() that it's safe to reset readLoopStarted. Without this
-	// defer, Close() would reset readLoopStarted while readLoop is still alive,
-	// allowing Connect() to spawn a duplicate readLoop goroutine that reads from
-	// the same WebSocket → frame corruption → disconnection spiral.
 	defer func() {
 		c.mu.Lock()
 		if c.conn != nil {
 			c.conn.Close()
 			c.conn = nil
+			c.bufReader = nil
 		}
 		c.connected = false
 		c.mu.Unlock()
@@ -431,10 +419,9 @@ func (c *Client) readLoop(ctx context.Context) {
 	c.log.Debugf("readLoop started (persistent, with auto-reconnection)")
 
 	backoff := initialReconnectDelay
-	connStartTime := time.Now() // Track when current connection was established
+	connStartTime := time.Now()
 
 	for {
-		// Check if context is cancelled
 		select {
 		case <-ctx.Done():
 			c.log.Debugf("readLoop: context cancelled, exiting")
@@ -446,32 +433,26 @@ func (c *Client) readLoop(ctx context.Context) {
 		}
 
 		c.mu.RLock()
-		conn := c.conn
+		reader := c.bufReader
 		c.mu.RUnlock()
 
-		if conn == nil {
-			// Connection is nil - attempt reconnection with backoff
-			// But check stopCh and ctx during the wait
-			c.log.Debugf("readLoop: conn is nil, reconnecting in %v...", backoff)
+		if reader == nil {
+			c.log.Debugf("readLoop: reader is nil, reconnecting in %v...", backoff)
 
 			select {
 			case <-ctx.Done():
-				c.log.Debugf("readLoop: context cancelled during backoff")
 				return
 			case <-c.stopCh:
-				c.log.Debugf("readLoop: stopCh closed during backoff")
 				return
 			case <-time.After(backoff):
 			}
 
-			// Prevent concurrent dialAndLogin: if already dialing, wait for it to complete
 			if atomic.LoadInt32(&c.dialing) == 1 {
-				c.log.Debugf("readLoop: dialAndLogin already in progress, waiting...")
 				<-c.dialDone
-				continue // Re-check conn after waiting
+				continue
 			}
 
-			if err := c.dialAndLogin(ctx); err != nil {
+			if err := c.dialAndHandshake(ctx); err != nil {
 				c.log.Errorf("readLoop: reconnection failed: %v", err)
 				backoff *= 2
 				if backoff > maxReconnectDelay {
@@ -482,27 +463,23 @@ func (c *Client) readLoop(ctx context.Context) {
 
 			c.log.Infof("readLoop: reconnected successfully")
 			connStartTime = time.Now()
-			backoff = initialReconnectDelay // Reset backoff on success
+			backoff = initialReconnectDelay
 			continue
 		}
 
-		// FIXED: Create cancellable context for pingLoop
-		// CRITICAL: pingCancel MUST be called before continuing to next iteration,
-		// otherwise old pingLoop will run with stale connection after reconnect.
-		pingCtx, pingCancel := context.WithCancel(ctx)
-		go c.pingLoop(conn, pingCtx)
+		// Refresh read deadline before each read
+		c.mu.RLock()
+		conn := c.conn
+		c.mu.RUnlock()
 
-		// Set read deadline to detect silent disconnections
-		// (e.g., network partition, pool crash without TCP RST)
-		if err := conn.SetReadDeadline(time.Now().Add(readDeadlineDuration)); err != nil {
-			c.log.Debugf("readLoop: setReadDeadline error: %v", err)
+		if conn != nil {
+			if err := conn.SetReadDeadline(time.Now().Add(readDeadlineDuration)); err != nil {
+				c.log.Debugf("readLoop: setReadDeadline error: %v", err)
+			}
 		}
 
-		_, message, err := conn.ReadMessage()
-
-		// STOP pingLoop before processing read error or continuing to next iteration
-		pingCancel()
-
+		// Read next line
+		line, err := reader.ReadString('\n')
 		if err != nil {
 			connLifetime := time.Since(connStartTime)
 			c.log.Errorf("readLoop: read error after %v: %v", connLifetime.Round(time.Second), err)
@@ -512,195 +489,192 @@ func (c *Client) readLoop(ctx context.Context) {
 			if c.conn != nil {
 				c.conn.Close()
 				c.conn = nil
+				c.bufReader = nil
 			}
 			c.mu.Unlock()
 
-			// If connection died very quickly (< minConnectionLifetime), this is a
-			// rapid reconnect cycle — increase backoff to break the spin loop.
 			if connLifetime < minConnectionLifetime && backoff < maxReconnectDelay {
 				backoff *= 2
 				if backoff > maxReconnectDelay {
 					backoff = maxReconnectDelay
 				}
-				c.log.Warnf("readLoop: connection died quickly (%v), increasing backoff to %v",
-					connLifetime.Round(time.Second), backoff)
 			}
-			// Loop back - will reconnect on next iteration with backoff
 			continue
 		}
 
-		// Reset backoff on successful read (connection is healthy)
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Reset backoff on successful read
 		if backoff > initialReconnectDelay {
 			backoff = initialReconnectDelay
-			c.log.Debugf("readLoop: connection healthy, reset backoff to %v", backoff)
 		}
-
-		// Successful read — reset connection timer for lifetime tracking
 		connStartTime = time.Now()
 
-		if len(message) > 120 {
-			c.log.Debugf("Recv: %s...", string(message[:120]))
-		} else {
-			c.log.Debugf("Recv: %s", string(message))
-		}
-		c.handleMessage(ctx, message)
+		c.handleMessage(ctx, []byte(line))
 	}
 }
 
-// pingLoop sends periodic WebSocket ping frames to keep the connection alive.
-// NAT gateways and firewalls typically drop idle TCP connections after 60-120s.
-// Sending a ping every 25 seconds prevents this without the 90s readDeadline timeout.
-func (c *Client) pingLoop(conn *websocket.Conn, ctx context.Context) {
-	ticker := time.NewTicker(25 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// Normal: readLoop cancels this when ReadMessage returns (every message read)
-			return
-		case <-ticker.C:
-			if conn == nil {
-				return
-			}
-			// Lock sendMu to prevent concurrent write with sendRequest
-			// gorilla/websocket forbids concurrent WriteMessage calls
-			c.sendMu.Lock()
-			conn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration))
-			err := conn.WriteMessage(websocket.PingMessage, nil)
-			c.sendMu.Unlock()
-			if err != nil {
-				c.log.Debugf("pingLoop: ping write failed: %v (connection likely dead)", err)
-				return
-			}
-		}
-	}
-}
-
-// handleMessage processes incoming message
+// handleMessage processes incoming JSON message (notification or response)
 func (c *Client) handleMessage(ctx context.Context, data []byte) {
-	var msg map[string]interface{}
-	if err := json.Unmarshal(data, &msg); err != nil {
-		c.log.Errorf("Unmarshal error: %v", err)
+	// Try to parse as Stratum notification (has "method" but no "id")
+	var notif stratumNotification
+	if err := json.Unmarshal(data, &notif); err == nil && notif.Method != "" {
+		c.handleNotification(notif.Method, notif.Params)
 		return
 	}
 
-	method, ok := msg["method"].(string)
-	if !ok {
+	// Could be a response to a request (subscribe, authorize, submit)
+	var resp stratumResponse
+	if err := json.Unmarshal(data, &resp); err == nil && resp.ID != nil {
+		c.handleSubmitResponse(&resp)
 		return
 	}
+}
 
+// handleNotification processes a Stratum notification
+func (c *Client) handleNotification(method string, params json.RawMessage) {
 	switch method {
-	case "welcome":
-		c.log.Infof("Received welcome from pool")
+	case "mining.notify":
+		c.handleNotify(params)
+	default:
+		c.log.Debugf("Unknown notification: %s", method)
+	}
+}
 
-	case "loginSuccess":
-		c.log.Infof("Login successful")
-		// Send login success to channel
-		select {
-		case c.loginRespCh <- true:
-		default:
+// handleSubmitResponse processes a Stratum response (typically to mining.submit)
+func (c *Client) handleSubmitResponse(resp *stratumResponse) {
+	if resp.Error != nil {
+		c.log.Errorf("Stratum error (code=%d): %s", resp.Error.Code, resp.Error.Message)
+		c.resultCh <- &SubmitResult{
+			Accepted: false,
+			JobID:    0,
+			Message:  fmt.Sprintf("Stratum error: %s", resp.Error.Message),
 		}
+		return
+	}
 
-	case "newJob":
-		c.handleNewJob(msg)
-
-	case "job":
-		c.handleJob(msg)
-
-	case "shareAccepted":
-		// Pool sends {"method":"shareAccepted","params":{"jobId":...}}
-		// Read jobId from params, not root message
-		if params, ok := msg["params"].(map[string]interface{}); ok {
-			jobID := getUint64FromMap(params, "jobId")
-			c.resultCh <- &SubmitResult{
-				Accepted: true,
-				JobID:    jobID,
-				Message:  "Share accepted",
-			}
-			c.log.Infof("Share accepted! jobId=%d", jobID)
-		} else {
+	// mining.submit response: result is typically true/false
+	if accepted, ok := resp.Result.(bool); ok {
+		if accepted {
 			c.resultCh <- &SubmitResult{
 				Accepted: true,
 				JobID:    0,
 				Message:  "Share accepted",
 			}
 			c.log.Infof("Share accepted!")
-		}
-
-	case "shareRejected":
-		if params, ok := msg["params"].(map[string]interface{}); ok {
-			jobID := getUint64FromMap(params, "jobId")
-			c.resultCh <- &SubmitResult{
-				Accepted: false,
-				JobID:    jobID,
-				Message:  "Share rejected",
-			}
-			c.log.Warnf("Share rejected! jobId=%d", jobID)
 		} else {
 			c.resultCh <- &SubmitResult{
 				Accepted: false,
 				JobID:    0,
-				Message:  "Share rejected",
+				Message:  "Share rejected by pool",
 			}
-			c.log.Warnf("Share rejected")
-		}
-
-	case "jobExpired":
-		// Pool sends {"method":"jobExpired","params":{"jobId":...,"reason":"..."}}
-		// Treat as a rejection — the miner should get the latest job and try again
-		var jobID uint64
-		var reason string
-		if params, ok := msg["params"].(map[string]interface{}); ok {
-			jobID = getUint64FromMap(params, "jobId")
-			if r, ok := params["reason"].(string); ok {
-				reason = r
-			}
-		}
-		c.log.Warnf("Job expired: jobId=%d, reason=%s", jobID, reason)
-		c.resultCh <- &SubmitResult{
-			Accepted: false,
-			JobID:    jobID,
-			Message:  "Job expired: " + reason,
-		}
-
-	case "error":
-		if params, ok := msg["params"].(map[string]interface{}); ok {
-			if errMsg, ok := params["message"].(string); ok {
-				c.log.Errorf("Pool error: %s", errMsg)
-				// Send rejection to result channel so miner can react
-				c.resultCh <- &SubmitResult{
-					Accepted: false,
-					JobID:    getUint64FromMap(params, "jobId"),
-					Message:  errMsg,
-				}
-				// Also handle login failure if still waiting
-				select {
-				case c.loginRespCh <- false:
-				default:
-				}
-			}
+			c.log.Warnf("Share rejected by pool")
 		}
 	}
 }
 
-// handleNewJob handles new job notification
-func (c *Client) handleNewJob(msg map[string]interface{}) {
-	params, ok := msg["params"].(map[string]interface{})
-	if !ok {
+// handleNotify processes a mining.notify notification
+func (c *Client) handleNotify(params json.RawMessage) {
+	var p []interface{}
+	if err := json.Unmarshal(params, &p); err != nil || len(p) < 9 {
+		c.log.Errorf("Invalid mining.notify params: %v", err)
 		return
 	}
 
+	jobIDStr, _ := p[0].(string)
+	prevHash, _ := p[1].(string)
+	coinbase1, _ := p[2].(string)
+	coinbase2, _ := p[3].(string)
+	merkleBranches, _ := p[4].([]interface{})
+	version, _ := p[5].(string)
+	nBits, _ := p[6].(string)
+	nTime, _ := p[7].(string)
+	cleanJobs, _ := p[8].(bool)
+
+	// Parse jobID string to uint64
+	var jobID uint64
+	if _, err := fmt.Sscanf(jobIDStr, "%d", &jobID); err != nil {
+		c.log.Errorf("Parse jobID: %v", err)
+		return
+	}
+
+	// Parse difficulty from nBits (big-endian hex target)
+	difficulty := new(big.Int)
+	difficulty.SetString(nBits, 10)
+	if difficulty.Sign() <= 0 {
+		difficulty = big.NewInt(1)
+	}
+
+	// Parse timestamp from nTime (hex string, big-endian 4 bytes)
+	var timestamp int64
+	if nTime != "" {
+		tsBytes, err := hex.DecodeString(nTime)
+		if err == nil && len(tsBytes) > 0 {
+			for i := 0; i < len(tsBytes); i++ {
+				timestamp = (timestamp << 8) | int64(tsBytes[i])
+			}
+		}
+	}
+	if timestamp == 0 {
+		timestamp = time.Now().Unix()
+	}
+
+	_ = coinbase1
+	_ = coinbase2
+	_ = merkleBranches
+	_ = version
+	_ = cleanJobs
+
+	// ── Parse NogoChain extensions (indices 9-13) ──
+	// These fields are appended by NogoPool sendStratumJob and are NOT
+	// part of the standard Stratum protocol. They provide stateRoot,
+	// height, merkleRoot, extraNonce, and minerAddress for correct PoW.
+	var stateRoot string
+	var notifHeight uint64
+	var merkleRootStr string
+	var extraNonceFromJob string
+	var minerAddress string
+
+	if len(p) > 9 {
+		stateRoot, _ = p[9].(string)
+	}
+	if len(p) > 10 {
+		if heightStr, ok := p[10].(string); ok {
+			fmt.Sscanf(heightStr, "%d", &notifHeight)
+		}
+	}
+	if len(p) > 11 {
+		merkleRootStr, _ = p[11].(string)
+	}
+	if len(p) > 12 {
+		extraNonceFromJob, _ = p[12].(string)
+	}
+	if len(p) > 13 {
+		minerAddress, _ = p[13].(string)
+	}
+
+	c.mu.RLock()
+	extraNonce1 := c.extraNonce1
+	c.mu.RUnlock()
+
+	// Prefer job-provided extraNonce over subscription extraNonce1
+	if extraNonceFromJob != "" {
+		extraNonce1 = extraNonceFromJob
+	}
+
 	job := &MiningJob{
-		JobID:        getUint64FromMap(params, "jobId"),
-		Height:       getUint64FromMap(params, "height"),
-		PrevHash:     getStringFromMap(params, "prevHash"),
-		MerkleRoot:   getStringFromMap(params, "merkleRoot"),
-		StateRoot:    getStringFromMap(params, "stateRoot"), // World State MPT root hash
-		Difficulty:   getBigIntFromMap(params, "difficulty"),
-		ExtraNonce:   getStringFromMap(params, "extraNonce"),
-		Timestamp:    getInt64FromMap(params, "timestamp"),
-		MinerAddress: getStringFromMap(params, "minerAddress"),
+		JobID:        jobID,
+		Height:       notifHeight,
+		PrevHash:     prevHash,
+		MerkleRoot:   merkleRootStr,
+		StateRoot:    stateRoot,
+		Difficulty:   difficulty,
+		ExtraNonce:   extraNonce1,
+		Timestamp:    timestamp,
+		MinerAddress: minerAddress,
 	}
 
 	c.mu.Lock()
@@ -709,15 +683,10 @@ func (c *Client) handleNewJob(msg map[string]interface{}) {
 
 	select {
 	case c.jobCh <- job:
-		c.log.Infof("New job received: height=%d, jobId=%d", job.Height, job.JobID)
+		c.log.Infof("New job received: jobId=%d, diff=%s", job.JobID, job.Difficulty.String())
 	default:
 		c.log.Warnf("Job channel full, dropping job")
 	}
-}
-
-// handleJob handles job response
-func (c *Client) handleJob(msg map[string]interface{}) {
-	c.handleNewJob(msg)
 }
 
 // GetJobChannel returns the job channel for receiving mining jobs
@@ -737,44 +706,81 @@ func (c *Client) GetCurrentJob() *MiningJob {
 	return c.lastJob
 }
 
-// SendHashReport sends a hash count report to the pool.
-// The pool uses these reports to track total hashes per miner for reward distribution.
-// Each call should send the INCREMENTAL hashes since the last report, not the cumulative total.
+// SendHashReport is a no-op for Stratum protocol.
+// Stratum does not support explicit hash rate reports; hash rate is inferred
+// from submitted shares by the pool.
 func (c *Client) SendHashReport(ctx context.Context, hashes uint64) error {
-	req := map[string]interface{}{
-		"method": "hashReport",
-		"params": map[string]interface{}{
-			"hashes": hashes,
-		},
-	}
-	return c.sendRequest(ctx, req)
+	return nil
 }
 
-// SubmitShare submits a share to the pool
+// SubmitShare submits a share via mining.submit
 func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
+	// Generate extraNonce2 and nTime for Stratum submission
+	extraNonce2 := fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
+	nTime := fmt.Sprintf("%08x", time.Now().Unix())
+	nonceHex := fmt.Sprintf("%016x", nonce)
+	jobIDStr := fmt.Sprintf("%d", jobID)
+
+	reqID := atomic.AddUint64(&c.nextRequestID, 1)
 	req := map[string]interface{}{
-		"method": "submit",
-		"params": map[string]interface{}{
-			"jobId": jobID,
-			"nonce": nonce,
+		"id":     reqID,
+		"method": "mining.submit",
+		"params": []string{
+			c.workerName,
+			jobIDStr,
+			extraNonce2,
+			nTime,
+			nonceHex,
 		},
 	}
 
-	c.log.Debugf("Submitting share: jobId=%d, nonce=%d", jobID, nonce)
-	return c.sendRequest(ctx, req)
+	data, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal submit: %w", err)
+	}
+
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	if err := conn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration)); err != nil {
+		c.log.Debugf("setWriteDeadline submit: %v", err)
+	}
+	if _, err := conn.Write(append(data, '\n')); err != nil {
+		if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+			c.log.Debugf("clear write deadline: %v", err)
+		}
+		fails := atomic.AddInt32(&c.writeFails, 1)
+		if int(fails) >= maxWriteFails {
+			conn.Close()
+			atomic.StoreInt32(&c.writeFails, 0)
+		}
+		return fmt.Errorf("submit share: %w", err)
+	}
+
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		c.log.Debugf("clear write deadline: %v", err)
+	}
+
+	atomic.StoreInt32(&c.writeFails, 0)
+	c.log.Debugf("Share submitted: jobId=%d, nonce=%d", jobID, nonce)
+	return nil
 }
 
-// IsReconnecting returns true if a dialAndLogin is currently in progress.
-// Health check uses this to avoid calling switchToNextPool while readLoop
-// is already handling reconnection — Close()+Connect() during dialAndLogin
-// would spawn duplicate readLoop goroutines (the root cause of disconnection).
+// IsReconnecting returns true if a dialAndHandshake is currently in progress.
 func (c *Client) IsReconnecting() bool {
 	return atomic.LoadInt32(&c.dialing) == 1
 }
 
 // IsAlive returns true if the readLoop goroutine is running and can handle
-// reconnection autonomously. External code (e.g. healthCheckLoop) MUST check
-// this before calling Close()+Connect() to avoid interrupting a healthy recovery.
+// reconnection autonomously.
 func (c *Client) IsAlive() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -798,48 +804,32 @@ func (c *Client) IsConnected() bool {
 
 // Close closes the connection and permanently stops the read loop.
 // After Close, the client can be reused by calling Connect() again.
-// readLoopStarted and stopCh are reset so that a subsequent Connect() call
-// can start a fresh read loop (needed for pool switching).
-//
-// CRITICAL: Close() waits for readLoop to confirm exit via readLoopDone before
-// resetting readLoopStarted. This prevents the race where Connect() starts a
-// second readLoop while the old one is still alive, causing multiple goroutines
-// to read from the same WebSocket → frame corruption → disconnection spiral.
 func (c *Client) Close() error {
 	c.mu.Lock()
 
-	// 1. Signal readLoop to stop
 	select {
 	case <-c.stopCh:
-		// Already closed
 	default:
 		close(c.stopCh)
 	}
 
-	// 2. Close active connection to break any blocking I/O in readLoop/dialAndLogin
 	if c.conn != nil {
 		if err := c.conn.Close(); err != nil {
 			c.log.Debugf("Close: connection close error: %v", err)
 		}
 		c.conn = nil
+		c.bufReader = nil
 	}
 	c.connected = false
 
-	// 3. Capture state under lock, then RELEASE lock before waiting.
-	// Must not hold c.mu during the wait because readLoop acquires
-	// c.mu.RLock() in its loop and c.mu.Lock() in its defer cleanup.
 	wasStarted := c.readLoopStarted
 	done := c.readLoopDone
 	c.mu.Unlock()
 
-	// 4. Wait for readLoop to confirm exit (only if it was ever started).
-	// If readLoop was never started (Connect never called), skip the wait
-	// to avoid blocking forever on an open channel.
 	if wasStarted {
 		<-done
 	}
 
-	// 5. Now safe to reset state — readLoop is truly dead.
 	c.mu.Lock()
 	c.readLoopStarted = false
 	c.stopCh = make(chan struct{})
@@ -847,65 +837,4 @@ func (c *Client) Close() error {
 	c.mu.Unlock()
 
 	return nil
-}
-
-// Helper functions
-func getUint64FromMap(m map[string]interface{}, key string) uint64 {
-	if v, ok := m[key]; ok {
-		switch val := v.(type) {
-		case float64:
-			return uint64(val)
-		case uint64:
-			return val
-		case int64:
-			return uint64(val)
-		case int:
-			return uint64(val)
-		}
-	}
-	return 0
-}
-
-func getStringFromMap(m map[string]interface{}, key string) string {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	return ""
-}
-
-func getBigIntFromMap(m map[string]interface{}, key string) *big.Int {
-	if v, ok := m[key]; ok {
-		switch val := v.(type) {
-		case float64:
-			return big.NewInt(int64(val))
-		case uint64:
-			return new(big.Int).SetUint64(val)
-		case int64:
-			return big.NewInt(val)
-		case int:
-			return big.NewInt(int64(val))
-		case string:
-			// Try parsing as string (for big.Int serialized as string)
-			if bi, ok := new(big.Int).SetString(val, 10); ok {
-				return bi
-			}
-		}
-	}
-	return big.NewInt(0)
-}
-
-func getInt64FromMap(m map[string]interface{}, key string) int64 {
-	if v, ok := m[key]; ok {
-		switch val := v.(type) {
-		case float64:
-			return int64(val)
-		case int64:
-			return val
-		case int:
-			return int64(val)
-		}
-	}
-	return 0
 }

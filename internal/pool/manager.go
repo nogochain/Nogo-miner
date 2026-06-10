@@ -392,7 +392,7 @@ func (m *Manager) GetStats() []PoolStats {
 func (m *Manager) IsConnected() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.currentPool >= 0 && m.currentPool >= 0 && m.currentPool < len(m.pools) && m.pools[m.currentPool].connected
+	return m.currentPool >= 0 && m.currentPool < len(m.pools) && m.pools[m.currentPool].connected
 }
 
 // GetPoolCount returns the number of configured pools
