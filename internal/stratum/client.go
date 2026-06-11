@@ -44,6 +44,10 @@ type Client struct {
 	log         Logger
 	connected   bool
 	jobCh       chan *MiningJob
+	// DEPRECATED: resultCh is a legacy broadcast channel superseded by pendingResults.
+	// pendingResults routes SubmitShare responses by JSON-RPC request ID, eliminating
+	// the race condition where multiple workers consumed each other's responses.
+	// resultCh is retained for backward-compatible reads only; writers MUST use pendingResults.
 	resultCh    chan *SubmitResult
 	lastJob     *MiningJob
 	// pendingResults maps JSON-RPC request IDs to dedicated response channels.
@@ -728,7 +732,9 @@ func (c *Client) GetJobChannel() <-chan *MiningJob {
 	return c.jobCh
 }
 
-// GetResultChannel returns the result channel for receiving submission results
+// DEPRECATED: GetResultChannel returns the legacy broadcast result channel.
+// Superseded by pendingResults (per-request ID routing). Retained for backward
+// compatibility; new code should use SubmitShare which returns per-call responses.
 func (c *Client) GetResultChannel() <-chan *SubmitResult {
 	return c.resultCh
 }
