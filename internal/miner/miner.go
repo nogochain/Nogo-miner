@@ -213,23 +213,19 @@ func (w *Worker) logHashRate(hashRate float64, duration time.Duration, hashes ui
 	}
 }
 
-// handleSuccess handles a successful mining result
-// P1 Issue 3.2: Race condition between submitSolution and handleSuccess
-// CRITICAL FIX: Add mutex to prevent concurrent submission
+// handleSuccess handles a successful mining result.
+// submitSolution now waits for the pool's response inline using a dedicated
+// per-request channel, so there is no separate listenForResult goroutine.
 func (m *Miner) handleSuccess(worker *Worker, result *nogopow.MiningResult, job *MiningJob) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	m.log.Infof("Worker %d found solution! Nonce: %d, Hashes: %d, JobID: %d",
 		worker.id, result.Nonce, result.HashesTried, job.JobIDNum)
 
 	// Submit to pool using the specific job the nonce was computed against.
 	// CRITICAL: Use the captured job reference, NOT m.currentJob, to avoid
 	// submitting with a different jobId than what the nonce was mined for.
+	// UploadShare returns a dedicated response channel; submitSolution blocks
+	// until the pool responds (with 15s timeout), then records the result.
 	m.submitSolution(result, job)
-
-	// Listen for submission result
-	go m.listenForResult()
 }
 
 // hashReportLoop sends periodic hash count reports to the pool every 30 seconds.
@@ -271,45 +267,15 @@ func (m *Miner) hashReportLoop() {
 	}
 }
 
-// listenForResult listens for share submission results
-func (m *Miner) listenForResult() {
-	client := m.poolManager.GetClient()
-	if client == nil {
-		return
-	}
-
-	resultCh := client.GetResultChannel()
-
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
-	defer cancel()
-
-	select {
-	case result, ok := <-resultCh:
-		if !ok {
-			return
-		}
-		if result.Accepted {
-			atomic.AddUint64(&m.submittedWork, 1)
-			atomic.AddUint64(&m.acceptedWork, 1)
-			m.poolManager.RecordShare(true)
-			m.monitor.RecordShare(true, "")
-			m.log.Infof("Share accepted! JobID: %d", result.JobID)
-		} else {
-			m.poolManager.RecordShare(false)
-			m.monitor.RecordShare(false, result.Message)
-			m.log.Warnf("Share rejected: %s", result.Message)
-		}
-	case <-ctx.Done():
-		// Timeout waiting for result
-		m.log.Debug("Timeout waiting for share result")
-	}
-}
-
 // submitSolution submits a solution to the pool using the specific job the nonce was mined for.
 // CRITICAL: The `job` parameter must be the exact job reference that was passed to worker.mine(),
 // NOT m.currentJob, because m.currentJob may have been updated to a different job while the
 // worker was mining. Using the wrong jobId for submission causes the pool to validate the
 // share against different parameters, resulting in "invalid PoW" rejection.
+//
+// Uses the per-request response channel returned by SubmitShare to wait for the pool's
+// verdict, eliminating the race condition where multiple workers consume each other's
+// responses from a shared channel.
 func (m *Miner) submitSolution(result *nogopow.MiningResult, job *MiningJob) {
 	client := m.poolManager.GetClient()
 	if client == nil {
@@ -322,18 +288,46 @@ func (m *Miner) submitSolution(result *nogopow.MiningResult, job *MiningJob) {
 		return
 	}
 
-	// Submit share to pool via Stratum client
-	ctx, cancel := context.WithTimeout(m.ctx, 3*time.Second)
-	defer cancel()
+	// Submit share to pool via Stratum client. SubmitShare now returns a
+	// dedicated response channel so each submission gets its own result.
+	submitCtx, submitCancel := context.WithTimeout(m.ctx, 3*time.Second)
+	defer submitCancel()
 
-	if err := client.SubmitShare(ctx, job.JobIDNum, result.Nonce); err != nil {
+	respCh, err := client.SubmitShare(submitCtx, job.JobIDNum, result.Nonce)
+	if err != nil {
 		m.log.Errorf("Failed to submit share: %v", err)
-		m.poolManager.RecordShare(false)
-		m.monitor.RecordShare(false, err.Error())
+		// Network errors are NOT PoW rejections; do not record as rejected share.
+		m.monitor.RecordShare(false, fmt.Sprintf("network: %v", err))
 		return
 	}
 
 	m.log.Infof("Share submitted: jobId=%d, nonce=%d", job.JobIDNum, result.Nonce)
+
+	// Wait for pool response with timeout. A slow response (>15s) is treated
+	// as unknown — not counted as either accepted or rejected.
+	resultCtx, resultCancel := context.WithTimeout(m.ctx, 15*time.Second)
+	defer resultCancel()
+
+	select {
+	case submitResult, ok := <-respCh:
+		if !ok {
+			m.log.Warn("Response channel closed unexpectedly")
+			return
+		}
+		if submitResult.Accepted {
+			atomic.AddUint64(&m.submittedWork, 1)
+			atomic.AddUint64(&m.acceptedWork, 1)
+			m.poolManager.RecordShare(true)
+			m.monitor.RecordShare(true, "")
+			m.log.Infof("Share accepted! JobID: %d", submitResult.JobID)
+		} else {
+			m.poolManager.RecordShare(false)
+			m.monitor.RecordShare(false, submitResult.Message)
+			m.log.Warnf("Share rejected: %s", submitResult.Message)
+		}
+	case <-resultCtx.Done():
+		m.log.Debug("Timeout waiting for share result")
+	}
 }
 
 // monitorJobs monitors and fetches new mining jobs from Stratum client.

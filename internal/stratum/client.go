@@ -46,6 +46,12 @@ type Client struct {
 	jobCh       chan *MiningJob
 	resultCh    chan *SubmitResult
 	lastJob     *MiningJob
+	// pendingResults maps JSON-RPC request IDs to dedicated response channels.
+	// Each SubmitShare call creates a channel; handleSubmitResponse routes the
+	// response to the correct caller by ID, eliminating the race condition
+	// where multiple workers consume each other's responses from resultCh.
+	pendingResults map[uint64]chan *SubmitResult
+	pendingMu      sync.Mutex
 
 	// Stratum protocol state
 	subscribeID     string
@@ -149,17 +155,18 @@ func NewClient(poolURL, minerAddr string, log Logger) *Client {
 	}
 
 	return &Client{
-		poolURL:      poolURL,
-		poolHost:     poolHost,
-		poolPort:     poolPort,
-		minerAddr:    minerAddr,
-		workerName:   minerAddr,
-		password:     "x",
-		log:          log,
-		jobCh:        make(chan *MiningJob, 10),
-		resultCh:     make(chan *SubmitResult, 10),
-		stopCh:       make(chan struct{}),
-		readLoopDone: make(chan struct{}),
+		poolURL:        poolURL,
+		poolHost:       poolHost,
+		poolPort:       poolPort,
+		minerAddr:      minerAddr,
+		workerName:     minerAddr,
+		password:       "x",
+		log:            log,
+		jobCh:          make(chan *MiningJob, 10),
+		resultCh:       make(chan *SubmitResult, 10),
+		pendingResults: make(map[uint64]chan *SubmitResult),
+		stopCh:         make(chan struct{}),
+		readLoopDone:   make(chan struct{}),
 	}
 }
 
@@ -544,36 +551,63 @@ func (c *Client) handleNotification(method string, params json.RawMessage) {
 	}
 }
 
-// handleSubmitResponse processes a Stratum response (typically to mining.submit)
+// handleSubmitResponse processes a Stratum response (typically to mining.submit).
+// Routes the response to the correct caller by JSON-RPC request ID, eliminating
+// the race condition where multiple workers consume each other's responses from
+// a shared channel.
 func (c *Client) handleSubmitResponse(resp *stratumResponse) {
-	if resp.Error != nil {
-		c.log.Errorf("Stratum error (code=%d): %s", resp.Error.Code, resp.Error.Message)
-		c.resultCh <- &SubmitResult{
-			Accepted: false,
-			JobID:    0,
-			Message:  fmt.Sprintf("Stratum error: %s", resp.Error.Message),
-		}
+	// Parse response ID to route to the correct caller.
+	var reqID uint64
+	if err := json.Unmarshal(resp.ID, &reqID); err != nil {
+		c.log.Warnf("Cannot parse response ID: %v", err)
 		return
 	}
 
-	// mining.submit response: result is typically true/false
-	if accepted, ok := resp.Result.(bool); ok {
-		if accepted {
-			c.resultCh <- &SubmitResult{
-				Accepted: true,
-				JobID:    0,
-				Message:  "Share accepted",
-			}
-			c.log.Infof("Share accepted!")
-		} else {
-			c.resultCh <- &SubmitResult{
-				Accepted: false,
-				JobID:    0,
-				Message:  "Share rejected by pool",
-			}
-			c.log.Warnf("Share rejected by pool")
-		}
+	c.pendingMu.Lock()
+	ch, ok := c.pendingResults[reqID]
+	if ok {
+		delete(c.pendingResults, reqID)
 	}
+	c.pendingMu.Unlock()
+
+	// Channel already consumed (timeout / caller stopped waiting) — drop.
+	if !ok {
+		return
+	}
+
+	result := &SubmitResult{JobID: reqID}
+
+	if resp.Error != nil {
+		c.log.Errorf("Stratum error (code=%d): %s", resp.Error.Code, resp.Error.Message)
+		result.Accepted = false
+		result.Message = fmt.Sprintf("Stratum error: %s", resp.Error.Message)
+		ch <- result
+		return
+	}
+
+	// mining.submit response: result is typically true/false.
+	accepted, isBool := resp.Result.(bool)
+	if !isBool {
+		// Non-bool result (e.g., {"result": {"status": "OK"}}). Treat as
+		// accepted if there is no error; the pool's custom response format
+		// may not follow the standard boolean convention.
+		c.log.Infof("Non-bool submit response (type=%T), assuming accepted", resp.Result)
+		result.Accepted = true
+		result.Message = "Share accepted"
+		ch <- result
+		return
+	}
+
+	if accepted {
+		result.Accepted = true
+		result.Message = "Share accepted"
+		c.log.Infof("Share accepted!")
+	} else {
+		result.Accepted = false
+		result.Message = "Share rejected by pool"
+		c.log.Warnf("Share rejected by pool")
+	}
+	ch <- result
 }
 
 // handleNotify processes a mining.notify notification
@@ -713,8 +747,11 @@ func (c *Client) SendHashReport(ctx context.Context, hashes uint64) error {
 	return nil
 }
 
-// SubmitShare submits a share via mining.submit
-func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
+// SubmitShare submits a share via mining.submit and returns a dedicated
+// response channel. Each call creates a separate channel keyed by request ID,
+// so multiple workers can submit shares concurrently without consuming each
+// other's responses.
+func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) (<-chan *SubmitResult, error) {
 	// Generate extraNonce2 and nTime for Stratum submission
 	extraNonce2 := fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
 	nTime := fmt.Sprintf("%08x", time.Now().Unix())
@@ -736,8 +773,15 @@ func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
 
 	data, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal submit: %w", err)
+		return nil, fmt.Errorf("marshal submit: %w", err)
 	}
+
+	// Register the dedicated response channel before sending so that the
+	// response handler can always find it, even for fast replies.
+	respCh := make(chan *SubmitResult, 1)
+	c.pendingMu.Lock()
+	c.pendingResults[reqID] = respCh
+	c.pendingMu.Unlock()
 
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
@@ -747,7 +791,11 @@ func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
 	c.mu.RUnlock()
 
 	if conn == nil {
-		return fmt.Errorf("not connected")
+		// Connection lost after registration — clean up.
+		c.pendingMu.Lock()
+		delete(c.pendingResults, reqID)
+		c.pendingMu.Unlock()
+		return nil, fmt.Errorf("not connected")
 	}
 
 	if err := conn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration)); err != nil {
@@ -757,12 +805,19 @@ func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
 		if err := conn.SetWriteDeadline(time.Time{}); err != nil {
 			c.log.Debugf("clear write deadline: %v", err)
 		}
+		// Write failure — clean up pendingResults so the handler does not
+		// send on a channel that no caller is waiting on (caller sees error).
+		c.pendingMu.Lock()
+		delete(c.pendingResults, reqID)
+		c.pendingMu.Unlock()
+		close(respCh)
+
 		fails := atomic.AddInt32(&c.writeFails, 1)
 		if int(fails) >= maxWriteFails {
 			conn.Close()
 			atomic.StoreInt32(&c.writeFails, 0)
 		}
-		return fmt.Errorf("submit share: %w", err)
+		return nil, fmt.Errorf("submit share: %w", err)
 	}
 
 	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
@@ -771,7 +826,7 @@ func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) error {
 
 	atomic.StoreInt32(&c.writeFails, 0)
 	c.log.Debugf("Share submitted: jobId=%d, nonce=%d", jobID, nonce)
-	return nil
+	return respCh, nil
 }
 
 // IsReconnecting returns true if a dialAndHandshake is currently in progress.
