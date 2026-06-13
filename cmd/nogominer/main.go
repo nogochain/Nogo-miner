@@ -137,9 +137,10 @@ running:
 				break running
 			}
 			// Log periodic status
-			log.Infof("Miner running normally | Hashrate: %s | Workers: %d",
-				formatHashRate(miner.GetStats().HashRate),
-				miner.GetStats().ActiveWorkers)
+			s := miner.GetStats()
+			log.Infof("Miner running normally | Avg: %s | Workers: %d",
+				formatHashRate(s.AvgHashRate),
+				s.ActiveWorkers)
 		}
 	}
 
@@ -164,7 +165,7 @@ func displayStats(stats *monitor.Stats, m *miner.Miner) {
 	fmt.Printf("║  Status: %-8s                                      ║\n", getStatus(minerStats.Running))
 	fmt.Printf("║  Uptime: %-10s                                     ║\n", formatUptime(stats.Uptime))
 	fmt.Printf("╠══════════════════════════════════════════════════════════╣\n")
-	fmt.Printf("║  Hashrate: %-12s (Hashes: %d)               ║\n", 
+	fmt.Printf("║  Avg: %-12s (Hashes: %d)               ║\n", 
 		formatHashRate(stats.AvgHashRate), stats.TotalHashes)
 	fmt.Printf("║  Workers: %-4d                                           ║\n", minerStats.ActiveWorkers)
 	fmt.Printf("╠══════════════════════════════════════════════════════════╣\n")

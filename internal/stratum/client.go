@@ -746,10 +746,61 @@ func (c *Client) GetCurrentJob() *MiningJob {
 	return c.lastJob
 }
 
-// SendHashReport is a no-op for Stratum protocol.
-// Stratum does not support explicit hash rate reports; hash rate is inferred
-// from submitted shares by the pool.
+// SendHashReport sends a mining.hashrate request to the pool with the
+// incremental hash count since the last report. The pool accumulates these
+// as TotalHashes for the miner, giving the frontend a continuously-updating
+// view of hash contributions between share submissions.
 func (c *Client) SendHashReport(ctx context.Context, hashes uint64) error {
+	c.mu.RLock()
+	workerName := c.workerName
+	c.mu.RUnlock()
+
+	reqID := atomic.AddUint64(&c.nextRequestID, 1)
+	req := map[string]interface{}{
+		"id":     reqID,
+		"method": "mining.hashrate",
+		"params": []string{
+			workerName,
+			fmt.Sprintf("%d", hashes),
+		},
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal hashrate: %w", err)
+	}
+
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	if err := conn.SetWriteDeadline(time.Now().Add(writeDeadlineDuration)); err != nil {
+		c.log.Debugf("setWriteDeadline hashrate: %v", err)
+	}
+	if _, err := conn.Write(append(data, '\n')); err != nil {
+		if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+			c.log.Debugf("clear write deadline: %v", err)
+		}
+		fails := atomic.AddInt32(&c.writeFails, 1)
+		if int(fails) >= maxWriteFails {
+			conn.Close()
+			atomic.StoreInt32(&c.writeFails, 0)
+		}
+		return fmt.Errorf("send hashrate: %w", err)
+	}
+
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		c.log.Debugf("clear write deadline: %v", err)
+	}
+
+	atomic.StoreInt32(&c.writeFails, 0)
 	return nil
 }
 
@@ -757,7 +808,11 @@ func (c *Client) SendHashReport(ctx context.Context, hashes uint64) error {
 // response channel. Each call creates a separate channel keyed by request ID,
 // so multiple workers can submit shares concurrently without consuming each
 // other's responses.
-func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) (<-chan *SubmitResult, error) {
+//
+// totalHashes is the cumulative hash count across all workers since mining
+// started. Attached as params[5] so the pool can compute the real per-share
+// delta instead of using the inaccurate difficulty*5 estimation.
+func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64, totalHashes uint64) (<-chan *SubmitResult, error) {
 	// Generate extraNonce2 and nTime for Stratum submission
 	extraNonce2 := fmt.Sprintf("%08x", time.Now().UnixNano()&0xFFFFFFFF)
 	nTime := fmt.Sprintf("%08x", time.Now().Unix())
@@ -774,6 +829,7 @@ func (c *Client) SubmitShare(ctx context.Context, jobID, nonce uint64) (<-chan *
 			extraNonce2,
 			nTime,
 			nonceHex,
+			fmt.Sprintf("%d", totalHashes),
 		},
 	}
 

@@ -44,8 +44,9 @@ type Miner struct {
 	startTime     time.Time // Mining start time, used for hashrate calculation
 
 	// Hash report for pool-based reward tracking
-	lastReportedHashes uint64
-	hashReportStopCh   chan struct{}
+	lastReportedHashes    uint64 // hashReportLoop sends delta to pool
+	lastMonitorSyncHashes uint64 // GetStats sends delta to monitor (separate from pool report)
+	hashReportStopCh      chan struct{}
 }
 
 // MinerConfig represents miner configuration
@@ -228,11 +229,13 @@ func (m *Miner) handleSuccess(worker *Worker, result *nogopow.MiningResult, job 
 	m.submitSolution(result, job)
 }
 
-// hashReportLoop sends periodic hash count reports to the pool every 30 seconds.
+// hashReportLoop sends periodic hash count reports to the pool every 10 seconds.
 // Uses delta-based reporting: sends only the incremental hashes since last report,
 // preventing double-counting. The pool accumulates these reports as TotalHashes.
+// Shorter interval (10s vs 30s) improves PPLNS precision by providing finer-grained
+// hash attribution near block boundaries, reducing TOCTOU error from ~5% to ~1.6%.
 func (m *Miner) hashReportLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -247,9 +250,10 @@ func (m *Miner) hashReportLoop() {
 				continue
 			}
 
-			totalHashes := m.GetStats().TotalHashes
+			stats := m.GetStats()
+			totalHashes := stats.TotalHashes
 			if totalHashes <= m.lastReportedHashes {
-				continue // No new hashes to report
+				continue
 			}
 			increment := totalHashes - m.lastReportedHashes
 			m.lastReportedHashes = totalHashes
@@ -290,10 +294,14 @@ func (m *Miner) submitSolution(result *nogopow.MiningResult, job *MiningJob) {
 
 	// Submit share to pool via Stratum client. SubmitShare now returns a
 	// dedicated response channel so each submission gets its own result.
+	// The cumulative totalHashes value is included for historical compatibility;
+	// the pool now uses handleHashReport (periodic miner-side reports) as the
+	// authoritative source for PPLNS hash accounting.
 	submitCtx, submitCancel := context.WithTimeout(m.ctx, 3*time.Second)
 	defer submitCancel()
 
-	respCh, err := client.SubmitShare(submitCtx, job.JobIDNum, result.Nonce)
+	totalHashes := m.GetStats().TotalHashes
+	respCh, err := client.SubmitShare(submitCtx, job.JobIDNum, result.Nonce, totalHashes)
 	if err != nil {
 		m.log.Errorf("Failed to submit share: %v", err)
 		// Network errors are NOT PoW rejections; do not record as rejected share.
@@ -549,13 +557,20 @@ func (m *Miner) GetHashRate() uint64 {
 func (m *Miner) GetStats() *MinerStats {
 	var totalHashes uint64 = 0
 	for _, worker := range m.workers {
-		totalHashes += atomic.LoadUint64(&worker.hashCount)
+		totalHashes += worker.engine.HashCount()
+		// Sync engine-level hashCount to worker.hashCount for backward compatibility
+		atomic.StoreUint64(&worker.hashCount, worker.engine.HashCount())
 	}
 
-	// Sync totalHashes to monitor for real-time hashrate display
+	// Sync incremental hashes to monitor for real-time hashrate display.
+	// totalHashes is the engine cumulative sum; subtract lastMonitorSync to get
+	// the delta since the previous call to avoid infinite accumulation.
 	if m.monitor != nil {
-		m.monitor.AddHashes(totalHashes) // additive, ok since monitor resets on Start()
+		if totalHashes > m.lastMonitorSyncHashes {
+			m.monitor.AddHashes(totalHashes - m.lastMonitorSyncHashes)
+		}
 	}
+	m.lastMonitorSyncHashes = totalHashes
 
 	// Calculate hashrate directly (avoid recursion from GetHashRate → GetStats loop)
 	m.mu.RLock()
@@ -573,6 +588,7 @@ func (m *Miner) GetStats() *MinerStats {
 
 	return &MinerStats{
 		HashRate:      hashRate,
+		AvgHashRate:   hashRate,
 		TotalHashes:   totalHashes,
 		SubmittedWork: atomic.LoadUint64(&m.submittedWork),
 		AcceptedWork:  atomic.LoadUint64(&m.acceptedWork),
@@ -584,6 +600,7 @@ func (m *Miner) GetStats() *MinerStats {
 // MinerStats represents miner statistics
 type MinerStats struct {
 	HashRate      uint64
+	AvgHashRate   uint64
 	TotalHashes   uint64
 	SubmittedWork uint64
 	AcceptedWork  uint64

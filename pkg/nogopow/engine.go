@@ -71,7 +71,8 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 	}
 	e.running = true
 	e.startTime = time.Now()
-	e.hashCount = 0 // Reset per-session hash counter for accurate hashrate
+	// Do NOT reset hashCount — it's the engine-level cumulative counter
+	// used by hashReportLoop for accurate per-report increment calculation.
 	e.mu.Unlock()
 
 	// Use named result so defer can capture last nonce for continuation
@@ -156,6 +157,15 @@ func (e *Engine) Mine(header *BlockHeader, stopCh <-chan struct{}) *MiningResult
 		HashesTried: localHashCount,
 		Duration:    time.Since(startTime),
 	}
+}
+
+// HashCount returns the engine-level cumulative hash count.
+// Unlike MiningResult.HashesTried (which resets each Mine() call),
+// this counter is never reset and provides the true cumulative total.
+func (e *Engine) HashCount() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.hashCount
 }
 
 // computeBlockHash computes the hash using node's exact algorithm
